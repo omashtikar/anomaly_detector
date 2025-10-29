@@ -7,6 +7,12 @@ import threading
 import time
 
 import streamlit as st
+import pandas as pd
+
+try:
+    from ohlcv import ticks_to_ohlcv
+except Exception:
+    ticks_to_ohlcv = None
 
 try:
     from websocket import WebSocketApp
@@ -121,6 +127,31 @@ def drain_queue():
 status_placeholder = st.empty()
 error_placeholder = st.empty()
 metric_placeholder = st.empty()
+bars_placeholder = st.empty()
+
+
+# ---- OHLCV helpers ----
+def _ticks_only():
+    return [
+        m for m in st.session_state.messages
+        if isinstance(m, dict) and all(k in m for k in ("ts", "price", "volume"))
+    ]
+
+
+def _render_ohlcv_list():
+    if ticks_to_ohlcv is None:
+        bars_placeholder.info("ohlcv.py missing — cannot compute bars.")
+        return
+    bars = ticks_to_ohlcv(_ticks_only(), interval_s=10)
+    if bars:
+        try:
+            df = pd.DataFrame(bars)[["start", "end", "open", "high", "low", "close", "volume"]]
+            bars_placeholder.dataframe(df, use_container_width=True)
+        except Exception:
+            # Fallback to plain listing
+            bars_placeholder.write(bars)
+    else:
+        bars_placeholder.info("No OHLCV bars yet — collect more ticks.")
 
 # live update toggle
 live = st.toggle("Live update", value=True, help="Continuously refresh the message count.")
@@ -130,7 +161,7 @@ drain_queue()
 status_placeholder.write(f"Status: **{st.session_state.ws_status}**")
 if st.session_state.ws_error:
     error_placeholder.error(st.session_state.ws_error)
-metric_placeholder.metric("Messages collected", len(st.session_state.messages))
+_render_ohlcv_list()
 
 # live loop (no extra packages; updates UI ~2x/sec)
 if live and st.session_state.ws_status in {"connecting", "connected"}:
@@ -139,7 +170,7 @@ if live and st.session_state.ws_status in {"connecting", "connected"}:
     for _ in range(1200):  # ~10 minutes total; rerun or toggle again to extend
         changed = drain_queue()
         if changed:
-            metric_placeholder.metric("Messages collected", len(st.session_state.messages))
+            _render_ohlcv_list()
             status_placeholder.write(f"Status: **{st.session_state.ws_status}**")
             if st.session_state.ws_error:
                 error_placeholder.error(st.session_state.ws_error)
