@@ -27,7 +27,7 @@ def rate_of_change(values):
     return rates
 
 
-def detect_anomalies(rates):
+def detect_anomalies_zscore(rates):
     """
     Detect anomalies in a list of rates of change.
 

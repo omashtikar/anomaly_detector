@@ -8,6 +8,7 @@ import time
 
 import streamlit as st
 import pandas as pd
+import plotly.graph_objects as go
 
 try:
     from ohlcv import ticks_to_ohlcv
@@ -65,7 +66,7 @@ def ws_worker(url: str, out_q: queue.Queue, stop_event: threading.Event):
 
 # ----- UI -----
 st.title("WebSocket Collector")
-st.caption("Connects to a WebSocket, collects messages, and shows the live count.")
+st.caption("Connects to a WebSocket, collects messages, and shows OHLCV bars.")
 
 st.session_state.ws_url = st.text_input(
     "WebSocket URL",
@@ -144,12 +145,33 @@ def _render_ohlcv_list():
         return
     bars = ticks_to_ohlcv(_ticks_only(), interval_s=10)
     if bars:
-        try:
-            df = pd.DataFrame(bars)[["start", "end", "open", "high", "low", "close", "volume"]]
-            bars_placeholder.dataframe(df, use_container_width=True)
-        except Exception:
-            # Fallback to plain listing
-            bars_placeholder.write(bars)
+        # Build DataFrame and render as candlestick chart
+        df = pd.DataFrame(bars)[["start", "open", "high", "low", "close", "volume"]]
+        df = df.sort_values("start")
+        df["start_dt"] = pd.to_datetime(df["start"], unit="s")
+
+        fig = go.Figure(
+            data=[
+                go.Candlestick(
+                    x=df["start_dt"],
+                    open=df["open"],
+                    high=df["high"],
+                    low=df["low"],
+                    close=df["close"],
+                    increasing_line_color="#26a69a",
+                    decreasing_line_color="#ef5350",
+                    name="OHLC",
+                )
+            ]
+        )
+        fig.update_layout(
+            margin=dict(l=10, r=10, t=20, b=10),
+            xaxis_title="Time",
+            yaxis_title="Price",
+            xaxis_rangeslider_visible=False,
+            height=420,
+        )
+        bars_placeholder.plotly_chart(fig, use_container_width=True)
     else:
         bars_placeholder.info("No OHLCV bars yet — collect more ticks.")
 
@@ -175,3 +197,4 @@ if live and st.session_state.ws_status in {"connecting", "connected"}:
             if st.session_state.ws_error:
                 error_placeholder.error(st.session_state.ws_error)
         time.sleep(0.5)
+
