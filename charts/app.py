@@ -21,12 +21,21 @@ except ImportError:
     st.error("Missing dependency: install with `pip install websocket-client`")
     st.stop()
 
+# Anomaly utils
+try:
+    from utils import rate_of_change, detect_anomalies_zscore
+except Exception:
+    rate_of_change = None
+    detect_anomalies_zscore = None
+
+
 # ----- CLI args -----
 def get_cli_args():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--ws", "--websocket", dest="ws", default=None, help="WebSocket URL")
     args, _ = parser.parse_known_args(sys.argv[1:])
     return args
+
 
 args = get_cli_args()
 
@@ -39,20 +48,25 @@ st.session_state.setdefault("ws_url", args.ws)
 st.session_state.setdefault("ws_status", "disconnected")
 st.session_state.setdefault("ws_error", None)
 
+
 # ----- WebSocket worker -----
 def ws_worker(url: str, out_q: queue.Queue, stop_event: threading.Event):
-    def on_open(ws): out_q.put({"_event": "open"})
+    def on_open(ws):
+        out_q.put({"_event": "open"})
+
     def on_message(ws, message):
         try:
             out_q.put(json.loads(message))
         except Exception:
             out_q.put(message)
-    def on_error(ws, error): out_q.put({"_event": "error", "error": str(error)})
+
+    def on_error(ws, error):
+        out_q.put({"_event": "error", "error": str(error)})
+
     def on_close(ws, status_code, close_msg):
         out_q.put({"_event": "close", "status_code": status_code, "reason": close_msg})
 
-    ws = WebSocketApp(url, on_open=on_open, on_message=on_message,
-                      on_error=on_error, on_close=on_close)
+    ws = WebSocketApp(url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
     t = threading.Thread(target=lambda: ws.run_forever(ping_interval=25, ping_timeout=10), daemon=True)
     t.start()
 
@@ -63,6 +77,7 @@ def ws_worker(url: str, out_q: queue.Queue, stop_event: threading.Event):
         ws.close()
     except Exception:
         pass
+
 
 # ----- UI -----
 st.title("WebSocket Collector")
@@ -75,6 +90,7 @@ st.session_state.ws_url = st.text_input(
 )
 
 col1, col2 = st.columns(2)
+
 
 def start_ws():
     if not st.session_state.ws_url:
@@ -92,10 +108,12 @@ def start_ws():
     st.session_state.ws_thread.start()
     st.session_state.ws_status = "connecting"
 
+
 def stop_ws():
     if st.session_state.ws_thread and st.session_state.ws_thread.is_alive():
         st.session_state.ws_stop_event.set()
     st.session_state.ws_status = "disconnected"
+
 
 with col1:
     if st.button("Start WebSocket", type="primary", use_container_width=True):
@@ -103,6 +121,7 @@ with col1:
 with col2:
     if st.button("Stop WebSocket", use_container_width=True):
         stop_ws()
+
 
 # drain queue helper
 def drain_queue():
@@ -124,6 +143,7 @@ def drain_queue():
             st.session_state.messages.append(item)
     return updated
 
+
 # status row
 status_placeholder = st.empty()
 error_placeholder = st.empty()
@@ -141,7 +161,7 @@ def _ticks_only():
 
 def _render_ohlcv_list():
     if ticks_to_ohlcv is None:
-        bars_placeholder.info("ohlcv.py missing — cannot compute bars.")
+        bars_placeholder.info("ohlcv.py missing - cannot compute bars.")
         return
     bars = ticks_to_ohlcv(_ticks_only(), interval_s=10)
     if bars:
@@ -164,6 +184,30 @@ def _render_ohlcv_list():
                 )
             ]
         )
+
+        # ---- Anomaly overlay using close-to-close returns ----
+        if rate_of_change and detect_anomalies_zscore:
+            closes = df["close"].tolist()
+            returns = rate_of_change(closes)  # len n-1
+            valid_returns = [r for r in returns if r is not None]
+            flags = [0]
+            if valid_returns:
+                flags += detect_anomalies_zscore(valid_returns)
+            if len(flags) < len(df):
+                flags += [0] * (len(df) - len(flags))
+            df["anomaly"] = flags[: len(df)]
+            mask = df["anomaly"] == 1
+            if mask.any():
+                fig.add_trace(
+                    go.Scatter(
+                        x=df.loc[mask, "start_dt"],
+                        y=df.loc[mask, "close"],
+                        mode="markers",
+                        marker=dict(symbol="triangle-up", size=10, color="#ffa726", line=dict(width=1, color="#6d4c41")),
+                        name="Anomaly",
+                    )
+                )
+
         fig.update_layout(
             margin=dict(l=10, r=10, t=20, b=10),
             xaxis_title="Time",
@@ -173,7 +217,8 @@ def _render_ohlcv_list():
         )
         bars_placeholder.plotly_chart(fig, use_container_width=True)
     else:
-        bars_placeholder.info("No OHLCV bars yet — collect more ticks.")
+        bars_placeholder.info("No OHLCV bars yet - collect more ticks.")
+
 
 # live update toggle
 live = st.toggle("Live update", value=True, help="Continuously refresh the message count.")
