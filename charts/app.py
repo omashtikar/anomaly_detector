@@ -213,7 +213,7 @@ def _render_ohlcv_list():
             xaxis_title="Time",
             yaxis_title="Price",
             xaxis_rangeslider_visible=False,
-            height=420,
+            height=680,
         )
         bars_placeholder.plotly_chart(fig, use_container_width=True)
     else:
@@ -243,3 +243,14 @@ if live and st.session_state.ws_status in {"connecting", "connected"}:
                 error_placeholder.error(st.session_state.ws_error)
         time.sleep(0.5)
 
+# Ensure the app uses wide layout so the chart can take more space
+try:
+    import streamlit as st  # type: ignore
+    # set_page_config must be called before any other st.* call
+    try:
+        st.set_page_config(layout="wide")
+    except Exception:
+        # Already configured or running in a non-Streamlit context
+        pass
+except Exception:
+    pass
