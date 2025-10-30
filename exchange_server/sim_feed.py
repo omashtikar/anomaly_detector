@@ -34,6 +34,13 @@ class JDParams:
     trading_seconds: float = 6.5 * 3600  # one "day" length
     seed: Optional[int] = 42    # RNG seed (None => nondeterministic)
 
+    # Anomaly controls (random rare spikes/drops + volume surges)
+    anomaly_prob: float = 0.002   # per-tick probability of anomaly
+    anomaly_min: float = 0.05     # min absolute price change (5%)
+    anomaly_max: float = 0.15     # max absolute price change (15%)
+    vol_anom_min: float = 3.0     # min volume multiplier on anomaly
+    vol_anom_max: float = 8.0     # max volume multiplier on anomaly
+
 
 def u_shape_profile(t_norm: float, a: float = 0.6, b: float = 0.6) -> float:
     """
@@ -75,13 +82,35 @@ def jd_price_volume_stream(params: JDParams) -> Iterator[Dict[str, Any]]:
         z = rng.standard_normal()
         has_jump = rng.random() < jump_prob
         J = rng.normal(params.jump_mu, params.jump_sigma) if has_jump else 0.0
+
+        # Base diffusion + jump
         r = drift + diff_scale * z + J
+
+        # Optional random anomaly spike/drop
+        has_anom = False
+        anom_sign = 0
+        if params.anomaly_prob > 0.0 and params.anomaly_max > 0.0:
+            if rng.random() < params.anomaly_prob:
+                has_anom = True
+                # Draw absolute price move between [anom_min, anom_max]
+                delta_abs = float(rng.uniform(max(1e-6, params.anomaly_min), params.anomaly_max))
+                anom_sign = -1 if rng.random() < 0.5 else 1
+                # Convert to log-return; ensure positive base for log
+                move = math.log(1.0 + anom_sign * delta_abs)
+                r += move
         S *= math.exp(r)
 
         # ----- Volume: seasonality + AR(1) + volatility and jump sensitivity -----
         season = u_shape_profile(t_norm)
         eps_v = rng.normal(0.0, params.sigma_v)
         logV = season + params.phi * logV + params.beta * abs(r) + (params.gamma if has_jump else 0.0) + eps_v
+
+        # Amplify volume during anomalies
+        if has_anom:
+            low = max(1.0, params.vol_anom_min)
+            high = max(low, params.vol_anom_max)
+            vol_mult = float(rng.uniform(low, high))
+            logV += math.log(vol_mult)
         V = max(1.0, math.exp(logV))
 
         yield {
@@ -90,7 +119,9 @@ def jd_price_volume_stream(params: JDParams) -> Iterator[Dict[str, Any]]:
             "price": S,
             "ret": r,
             "jump": bool(has_jump),
-            "volume": V
+            "volume": V,
+            "anomaly": bool(has_anom),
+            "atype": ("spike_down" if has_anom and anom_sign < 0 else ("spike_up" if has_anom else None)),
         }
 
         # time.sleep(params.dt)
@@ -164,6 +195,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gamma", type=float, default=0.7)
     p.add_argument("--sigma-v", type=float, default=0.35)
     p.add_argument("--trading-seconds", type=float, default=6.5*3600)
+    # anomaly options
+    p.add_argument("--anomaly-prob", type=float, default=0.002, help="Per-tick probability of price/volume anomaly.")
+    p.add_argument("--anomaly-min", type=float, default=0.05, help="Min absolute price change for anomaly (e.g., 0.05=5%).")
+    p.add_argument("--anomaly-max", type=float, default=0.15, help="Max absolute price change for anomaly (e.g., 0.15=15%).")
+    p.add_argument("--vol-anom-min", type=float, default=3.0, help="Min volume multiplier when anomaly occurs.")
+    p.add_argument("--vol-anom-max", type=float, default=8.0, help="Max volume multiplier when anomaly occurs.")
     # websocket options
     p.add_argument("--host", type=str, default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000)
@@ -187,6 +224,11 @@ def main():
         gamma=args.gamma,
         sigma_v=args.sigma_v,
         trading_seconds=args.trading_seconds,
+        anomaly_prob=args.anomaly_prob,
+        anomaly_min=args.anomaly_min,
+        anomaly_max=args.anomaly_max,
+        vol_anom_min=args.vol_anom_min,
+        vol_anom_max=args.vol_anom_max,
     )
 
     if args.mode == "stdout":
