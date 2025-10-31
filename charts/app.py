@@ -25,24 +25,12 @@ except ImportError:
 # Anomaly utils
 try:
     from utils import (
-        rate_of_change,
-        detect_anomalies_zscore,
-        rate_of_change_open,
-        detect_open_anomalies_zscore,
-        rate_of_change_high,
-        detect_high_anomalies_zscore,
-        rate_of_change_low,
-        detect_low_anomalies_zscore,
+        detect_price_anomalies_zscore,
+        detect_volume_anomalies_zscore,
     )
 except Exception:
-    rate_of_change = None
-    detect_anomalies_zscore = None
-    rate_of_change_open = None
-    detect_open_anomalies_zscore = None
-    rate_of_change_high = None
-    detect_high_anomalies_zscore = None
-    rate_of_change_low = None
-    detect_low_anomalies_zscore = None
+    detect_price_anomalies_zscore = None
+    detect_volume_anomalies_zscore = None
 
 
 # ----- CLI args -----
@@ -210,6 +198,51 @@ def _render_ohlcv_list():
         secondary_y=True,
     )
 
+    # Z-score anomaly markers for price and volume
+    price_count = 0
+    vol_count = 0
+
+    if detect_price_anomalies_zscore:
+        price_flags = detect_price_anomalies_zscore(df["price"].tolist())
+        if price_flags:
+            mask = pd.Series(price_flags[: len(df)]) == 1
+            if mask.any():
+                price_count = int(mask.sum())
+                fig.add_trace(
+                    go.Scatter(
+                        x=df.loc[mask, "dt"],
+                        y=df.loc[mask, "price"],
+                        mode="markers",
+                        name="Price anomaly",
+                        marker=dict(color="#9c27b0", size=11, symbol="circle", line=dict(color="#1b1b1b", width=1)),
+                        hovertemplate="Price anomaly: %{y:.4f}<extra></extra>",
+                    ),
+                    secondary_y=False,
+                )
+                # Add subtle vlines at anomaly timestamps for visibility
+                for x_val in df.loc[mask, "dt"]:
+                    fig.add_vline(x=x_val, line_color="#9c27b0", opacity=0.15)
+
+    if detect_volume_anomalies_zscore:
+        vol_flags = detect_volume_anomalies_zscore(df["volume"].tolist())
+        if vol_flags:
+            mask_v = pd.Series(vol_flags[: len(df)]) == 1
+            if mask_v.any():
+                vol_count = int(mask_v.sum())
+                fig.add_trace(
+                    go.Scatter(
+                        x=df.loc[mask_v, "dt"],
+                        y=df.loc[mask_v, "volume"],
+                        mode="markers",
+                        name="Volume anomaly",
+                        marker=dict(color="#ff8f00", size=10, symbol="diamond", line=dict(color="#1b1b1b", width=1)),
+                        hovertemplate="Volume anomaly: %{y:.0f}<extra></extra>",
+                    ),
+                    secondary_y=True,
+                )
+                for x_val in df.loc[mask_v, "dt"]:
+                    fig.add_vline(x=x_val, line_color="#ff8f00", opacity=0.12, line_dash="dot")
+
     fig.update_layout(
         margin=dict(l=10, r=10, t=20, b=10),
         xaxis_title="Time",
@@ -219,6 +252,14 @@ def _render_ohlcv_list():
         legend_tracegroupgap=6,
     )
     bars_placeholder.plotly_chart(fig, use_container_width=True)
+
+    # Streamlit metrics for quick anomaly visibility
+    try:
+        c1, c2 = metric_placeholder.columns(2)
+        c1.metric(label="Price anomalies", value=str(price_count))
+        c2.metric(label="Volume anomalies", value=str(vol_count))
+    except Exception:
+        metric_placeholder.write(f"Price anomalies: {price_count} | Volume anomalies: {vol_count}")
 
 
 # live update toggle

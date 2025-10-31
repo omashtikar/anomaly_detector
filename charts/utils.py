@@ -242,3 +242,75 @@ def detect_low_anomalies_zscore(lows):
         flags_aligned = flags_aligned[:n]
 
     return flags_aligned
+
+
+def detect_price_anomalies_zscore(prices):
+    """
+    Detect anomalies in tick price using z-score on tick-to-tick returns.
+
+    Returns a 0/1 list aligned to len(prices). First element is 0.
+    """
+    n = len(prices)
+    if n == 0:
+        return []
+    if n == 1:
+        return [0]
+
+    returns = rate_of_change(prices)  # may include None if prev == 0
+    if not returns:
+        return [0] * n
+
+    valid_returns = [r for r in returns if r is not None]
+    valid_flags = detect_anomalies_zscore(valid_returns) if valid_returns else []
+
+    mapped_flags = []
+    j = 0
+    for r in returns:
+        if r is None:
+            mapped_flags.append(0)
+        else:
+            mapped_flags.append(1 if (j < len(valid_flags) and valid_flags[j] == 1) else 0)
+            j += 1
+
+    flags_aligned = [0] + mapped_flags
+    if len(flags_aligned) < n:
+        flags_aligned += [0] * (n - len(flags_aligned))
+    elif len(flags_aligned) > n:
+        flags_aligned = flags_aligned[:n]
+    return flags_aligned
+
+
+def detect_volume_anomalies_zscore(volumes):
+    """
+    Detect anomalies in tick volume using z-score on tick-to-tick volume change (rate of change).
+
+    Returns a 0/1 list aligned to len(volumes). First element is 0.
+    """
+    n = len(volumes)
+    if n == 0:
+        return []
+    if n == 1:
+        return [0]
+
+    vol_returns = rate_of_change(volumes)  # may include None if prev == 0
+    if not vol_returns:
+        return [0] * n
+
+    valid = [r for r in vol_returns if r is not None]
+    valid_flags = detect_anomalies_zscore(valid) if valid else []
+
+    mapped_flags = []
+    j = 0
+    for r in vol_returns:
+        if r is None:
+            mapped_flags.append(0)
+        else:
+            mapped_flags.append(1 if (j < len(valid_flags) and valid_flags[j] == 1) else 0)
+            j += 1
+
+    flags_aligned = [0] + mapped_flags
+    if len(flags_aligned) < n:
+        flags_aligned += [0] * (n - len(flags_aligned))
+    elif len(flags_aligned) > n:
+        flags_aligned = flags_aligned[:n]
+    return flags_aligned
