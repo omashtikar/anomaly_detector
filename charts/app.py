@@ -9,6 +9,7 @@ import time
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 try:
     from ohlcv import ticks_to_ohlcv
@@ -28,12 +29,20 @@ try:
         detect_anomalies_zscore,
         rate_of_change_open,
         detect_open_anomalies_zscore,
+        rate_of_change_high,
+        detect_high_anomalies_zscore,
+        rate_of_change_low,
+        detect_low_anomalies_zscore,
     )
 except Exception:
     rate_of_change = None
     detect_anomalies_zscore = None
     rate_of_change_open = None
     detect_open_anomalies_zscore = None
+    rate_of_change_high = None
+    detect_high_anomalies_zscore = None
+    rate_of_change_low = None
+    detect_low_anomalies_zscore = None
 
 
 # ----- CLI args -----
@@ -171,7 +180,7 @@ def _render_ohlcv_list():
     if ticks_to_ohlcv is None:
         bars_placeholder.info("ohlcv.py missing - cannot compute bars.")
         return
-    bars = ticks_to_ohlcv(_ticks_only(), interval_s=10)
+    bars = ticks_to_ohlcv(_ticks_only(), interval_s=5)
     if bars:
         # Build DataFrame and render as candlestick chart
         df = pd.DataFrame(bars)[["start", "open", "high", "low", "close", "volume"]]
@@ -197,23 +206,60 @@ def _render_ohlcv_list():
         # Work with completed bars only for plotting
         df = df_completed
 
-        fig = go.Figure(
-            data=[
-                go.Candlestick(
-                    x=df["start_dt"],
-                    open=df["open"],
-                    high=df["high"],
-                    low=df["low"],
-                    close=df["close"],
-                    increasing_line_color="#26a69a",
-                    decreasing_line_color="#ef5350",
-                    name="OHLC",
-                )
-            ]
+        # Create subplots: price (row 1) and volume (row 2)
+        fig = make_subplots(
+            rows=2,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.02,
+            row_heights=[0.75, 0.25],
+        )
+
+        # Price candlestick on row 1
+        fig.add_trace(
+            go.Candlestick(
+                x=df["start_dt"],
+                open=df["open"],
+                high=df["high"],
+                low=df["low"],
+                close=df["close"],
+                increasing_line_color="#26a69a",
+                decreasing_line_color="#ef5350",
+                name="OHLC",
+            ),
+            row=1,
+            col=1,
+        )
+
+        # Volume bars on row 2, colored by direction
+        try:
+            dir_series = (df["close"] - df["open"]).apply(lambda x: 1 if x >= 0 else -1)
+        except Exception:
+            dir_series = pd.Series([1] * len(df), index=df.index)
+        vol_colors = dir_series.map({1: "#26a69a", -1: "#ef5350"}).tolist()
+        fig.add_trace(
+            go.Bar(
+                x=df["start_dt"],
+                y=df["volume"],
+                marker_color=vol_colors,
+                name="Volume",
+                opacity=0.7,
+            ),
+            row=2,
+            col=1,
         )
 
         # Baseline for anomaly dots along the bottom of the chart
         y_baseline = float(df["low"].min())
+        # Use small vertical offsets so multiple anomaly dots at the same x are all visible
+        price_min = float(df["low"].min())
+        price_max = float(df["high"].max())
+        price_range = max(1e-9, price_max - price_min)
+        y_offset = price_range * 0.01  # 1% of price range
+        y_close_level = y_baseline
+        y_open_level = y_baseline + y_offset
+        y_high_level = y_baseline + (2 * y_offset)
+        y_low_level = y_baseline + (3 * y_offset)
 
         # ---- Anomaly overlay using close-to-close returns ----
         if rate_of_change and detect_anomalies_zscore:
@@ -236,7 +282,7 @@ def _render_ohlcv_list():
                 fig.add_trace(
                     go.Scatter(
                         x=x_anom,
-                        y=[y_baseline] * len(x_anom),
+                        y=[y_close_level] * len(x_anom),
                         customdata=y_anom,
                         mode="markers",
                         marker=dict(
@@ -247,7 +293,9 @@ def _render_ohlcv_list():
                         ),
                         name="Close anomaly",
                         hovertemplate="Anomaly close: %{customdata:.4f}<extra></extra>",
-                    )
+                    ),
+                    row=1,
+                    col=1,
                 )
 
                 # Arrows removed per request; keep only bottom dots
@@ -268,7 +316,7 @@ def _render_ohlcv_list():
                 fig.add_trace(
                     go.Scatter(
                         x=x_open,
-                        y=[y_baseline] * len(x_open),
+                        y=[y_open_level] * len(x_open),
                         customdata=y_open,
                         mode="markers",
                         marker=dict(
@@ -279,17 +327,88 @@ def _render_ohlcv_list():
                         ),
                         name="Open anomaly",
                         hovertemplate="Anomaly open: %{customdata:.4f}<extra></extra>",
-                    )
+                    ),
+                    row=1,
+                    col=1,
                 )
 
                 # Arrows removed per request; keep only bottom dots
 
+        # ---- Anomaly overlay using high-to-high returns ----
+        if rate_of_change_high and detect_high_anomalies_zscore:
+            highs = df["high"].tolist()
+            high_flags = detect_high_anomalies_zscore(highs)
+            if len(high_flags) < len(df):
+                high_flags += [0] * (len(df) - len(high_flags))
+            df["anomaly_high"] = high_flags[: len(df)]
+            mask_high = df["anomaly_high"] == 1
+            if mask_high.any():
+                high_color = "#ff8f00"  # orange for high anomalies
+                x_high = df.loc[mask_high, "start_dt"]
+                y_high = df.loc[mask_high, "high"]
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=x_high,
+                        y=[y_high_level] * len(x_high),
+                        customdata=y_high,
+                        mode="markers",
+                        marker=dict(
+                            symbol="circle",
+                            size=10,
+                            color=high_color,
+                            line=dict(width=1, color="#1b1b1b"),
+                        ),
+                        name="High anomaly",
+                        hovertemplate="Anomaly high: %{customdata:.4f}<extra></extra>",
+                    ),
+                    row=1,
+                    col=1,
+                )
+
+        # Low anomalies
+
+        # ---- Anomaly overlay using low-to-low returns ----
+        if rate_of_change_low and detect_low_anomalies_zscore:
+            lows = df["low"].tolist()
+            low_flags = detect_low_anomalies_zscore(lows)
+            if len(low_flags) < len(df):
+                low_flags += [0] * (len(df) - len(low_flags))
+            df["anomaly_low"] = low_flags[: len(df)]
+            mask_low = df["anomaly_low"] == 1
+            if mask_low.any():
+                low_color = "#43a047"  # green for low anomalies
+                x_low = df.loc[mask_low, "start_dt"]
+                y_low = df.loc[mask_low, "low"]
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=x_low,
+                        y=[y_low_level] * len(x_low),
+                        customdata=y_low,
+                        mode="markers",
+                        marker=dict(
+                            symbol="circle",
+                            size=10,
+                            color=low_color,
+                            line=dict(width=1, color="#1b1b1b"),
+                        ),
+                        name="Low anomaly",
+                        hovertemplate="Anomaly low: %{customdata:.4f}<extra></extra>",
+                    ),
+                    row=1,
+                    col=1,
+                )
+
+        # Axes and layout
+        fig.update_xaxes(rangeslider_visible=False, row=1, col=1)
         fig.update_layout(
             margin=dict(l=10, r=10, t=20, b=10),
             xaxis_title="Time",
             yaxis_title="Price",
-            xaxis_rangeslider_visible=False,
-            height=680,
+            yaxis2_title="Volume",
+            height=720,
+            legend_tracegroupgap=6,
         )
         bars_placeholder.plotly_chart(fig, use_container_width=True)
     else:

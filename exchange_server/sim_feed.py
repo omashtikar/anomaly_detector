@@ -30,7 +30,7 @@ class JDParams:
     sigma_v: float = 0.35       # noise std in log-volume
 
     # Clock/time
-    dt: float = 1.0             # seconds between ticks
+    dt: float = 0.1             # seconds between ticks
     trading_seconds: float = 6.5 * 3600  # one "day" length
     seed: Optional[int] = 42    # RNG seed (None => nondeterministic)
 
