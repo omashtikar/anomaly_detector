@@ -55,8 +55,16 @@ st.session_state.setdefault("ws_stop_event", threading.Event())
 st.session_state.setdefault("ws_url", args.ws)
 st.session_state.setdefault("ws_status", "disconnected")
 st.session_state.setdefault("ws_error", None)
-st.session_state.setdefault("price_anoms", {})  # ts -> price
-st.session_state.setdefault("volume_anoms", {}) # ts -> volume
+# Per-method anomaly stores: { method: { "price": {ts: val}, "volume": {ts: val} } }
+st.session_state.setdefault(
+    "anoms",
+    {
+        "Z-Score": {"price": {}, "volume": {}},
+        "Abs-Mean+3Std": {"price": {}, "volume": {}},
+        "Isolation Forest": {"price": {}, "volume": {}},
+        "Model (Prophet)": {"price": {}, "volume": {}},
+    },
+)
 
 
 # ----- WebSocket worker -----
@@ -129,7 +137,7 @@ with left_col:
 
     anom_method = st.selectbox(
         "Anomaly detection method",
-        options=["Z-Score", "Abs-Mean+3Std", "Model (Prophet)"],
+        options=["Z-Score", "Abs-Mean+3Std", "Isolation Forest", "Model (Prophet)"],
         index=0,
         help="Choose how anomalies are detected on price and volume.",
     )
@@ -142,6 +150,28 @@ with left_col:
     with btn_col2:
         if st.button("Stop WebSocket", use_container_width=True, key="btn_stop_left"):
             stop_ws()
+
+    # Rolling window controls (use stable Streamlit keys; avoid manual reassignment)
+    st.session_state.setdefault("rolling_on", False)
+    st.session_state.setdefault("rolling_n", 20)
+    st.toggle(
+        "Rolling window (ON = use last N ticks)",
+        key="rolling_on",
+        value=st.session_state.get("rolling_on", False),
+        help="When ON, anomaly detection uses a rolling window of the most recent N ticks; when OFF, it uses all collected ticks.",
+    )
+    if st.session_state.get("rolling_on", False):
+        st.selectbox(
+            "Window size (ticks)",
+            options=[20, 50, 100],
+            index={20: 0, 50: 1, 100: 2}.get(int(st.session_state.get("rolling_n", 20) or 20), 0),
+            key="rolling_n",
+            help="Number of most recent ticks to include when Rolling window is ON.",
+        )
+    if st.session_state.get("rolling_on", False):
+        st.info("Rolling window ON: detection uses only the most recent N ticks (editable above).")
+    else:
+        st.info("Rolling window OFF: detection uses all collected ticks.")
 
 
 # drain queue helper
@@ -235,42 +265,102 @@ def _render_ohlcv_list():
     price_count = 0
     vol_count = 0
 
+    # Choose detection dataframe based on rolling window setting
+    rolling_on = st.session_state.get("rolling_on", False)
+    rolling_n = int(st.session_state.get("rolling_n", 20) or 20)
+    dfd = df.tail(max(1, rolling_n)) if rolling_on else df
+
     method = st.session_state.get("anom_method", "Z-Score")
+    # Ensure store exists for current method (handles older sessions missing new keys)
+    try:
+        st.session_state["anoms"].setdefault(method, {"price": {}, "volume": {}})
+    except Exception:
+        st.session_state["anoms"] = {method: {"price": {}, "volume": {}}}
     if method == "Z-Score":
         # Z-score based detection on tick-to-tick returns
         if detect_price_anomalies_zscore:
-            price_flags = detect_price_anomalies_zscore(df["price"].tolist())
+            price_flags = detect_price_anomalies_zscore(dfd["price"].tolist())
             if price_flags:
-                mask = pd.Series(price_flags[: len(df)]) == 1
+                mask = pd.Series(price_flags[: len(dfd)], index=dfd.index) == 1
                 # Persist newly found anomalies
                 if mask.any():
-                    for ts_val, y_val in zip(df.loc[mask, "ts"], df.loc[mask, "price"]):
-                        st.session_state["price_anoms"][float(ts_val)] = float(y_val)
+                    store = st.session_state["anoms"][method]["price"]
+                    for ts_val, y_val in zip(dfd.loc[mask, "ts"], dfd.loc[mask, "price"]):
+                        store[float(ts_val)] = float(y_val)
 
         if detect_volume_anomalies_zscore:
-            vol_flags = detect_volume_anomalies_zscore(df["volume"].tolist())
+            vol_flags = detect_volume_anomalies_zscore(dfd["volume"].tolist())
             if vol_flags:
-                mask_v = pd.Series(vol_flags[: len(df)]) == 1
+                mask_v = pd.Series(vol_flags[: len(dfd)], index=dfd.index) == 1
                 if mask_v.any():
-                    for ts_val, y_val in zip(df.loc[mask_v, "ts"], df.loc[mask_v, "volume"]):
-                        st.session_state["volume_anoms"][float(ts_val)] = float(y_val)
+                    store = st.session_state["anoms"][method]["volume"]
+                    for ts_val, y_val in zip(dfd.loc[mask_v, "ts"], dfd.loc[mask_v, "volume"]):
+                        store[float(ts_val)] = float(y_val)
     elif method == "Abs-Mean+3Std":
         # Absolute-return threshold method: |r| > mean(|r|) + 3*std(|r|)
         if detect_price_anomalies_absmean3std:
-            price_flags = detect_price_anomalies_absmean3std(df["price"].tolist())
+            price_flags = detect_price_anomalies_absmean3std(dfd["price"].tolist())
             if price_flags:
-                mask = pd.Series(price_flags[: len(df)]) == 1
+                mask = pd.Series(price_flags[: len(dfd)], index=dfd.index) == 1
                 if mask.any():
-                    for ts_val, y_val in zip(df.loc[mask, "ts"], df.loc[mask, "price"]):
-                        st.session_state["price_anoms"][float(ts_val)] = float(y_val)
+                    store = st.session_state["anoms"][method]["price"]
+                    for ts_val, y_val in zip(dfd.loc[mask, "ts"], dfd.loc[mask, "price"]):
+                        store[float(ts_val)] = float(y_val)
 
         if detect_volume_anomalies_absmean3std:
-            vol_flags = detect_volume_anomalies_absmean3std(df["volume"].tolist())
+            vol_flags = detect_volume_anomalies_absmean3std(dfd["volume"].tolist())
             if vol_flags:
-                mask_v = pd.Series(vol_flags[: len(df)]) == 1
+                mask_v = pd.Series(vol_flags[: len(dfd)], index=dfd.index) == 1
                 if mask_v.any():
-                    for ts_val, y_val in zip(df.loc[mask_v, "ts"], df.loc[mask_v, "volume"]):
-                        st.session_state["volume_anoms"][float(ts_val)] = float(y_val)
+                    store = st.session_state["anoms"][method]["volume"]
+                    for ts_val, y_val in zip(dfd.loc[mask_v, "ts"], dfd.loc[mask_v, "volume"]):
+                        store[float(ts_val)] = float(y_val)
+    elif method == "Isolation Forest":
+        # Apply Isolation Forest independently on price and volume only when enough data exists
+        if len(dfd) >= 10:
+            try:
+                import numpy as np  # type: ignore
+                from sklearn.ensemble import IsolationForest  # type: ignore
+            except Exception:
+                error_placeholder.info("Isolation Forest not available. Install scikit-learn to enable it.")
+            else:
+                # Price IF
+                p_vals = dfd["price"].to_numpy(dtype=float)
+                if p_vals.size:
+                    p_mu = float(np.mean(p_vals))
+                    p_sigma = float(np.std(p_vals)) or 1.0
+                    p_feat = ((p_vals - p_mu) / p_sigma).reshape(-1, 1)
+                    try:
+                        p_if = IsolationForest(n_estimators=100, contamination=0.005, random_state=42)
+                        p_if.fit(p_feat)
+                        p_pred = p_if.predict(p_feat)  # -1 outlier
+                        p_mask = p_pred == -1
+                    except Exception:
+                        p_mask = np.zeros(len(p_feat), dtype=bool)
+                    if p_mask.any():
+                        p_store = st.session_state["anoms"][method]["price"]
+                        for ts_val, p_val, is_anom in zip(dfd["ts"], dfd["price"], p_mask):
+                            if is_anom:
+                                p_store[float(ts_val)] = float(p_val)
+
+                # Volume IF
+                v_vals = dfd["volume"].to_numpy(dtype=float)
+                if v_vals.size:
+                    v_mu = float(np.mean(v_vals))
+                    v_sigma = float(np.std(v_vals)) or 1.0
+                    v_feat = ((v_vals - v_mu) / v_sigma).reshape(-1, 1)
+                    try:
+                        v_if = IsolationForest(n_estimators=100, contamination=0.005, random_state=42)
+                        v_if.fit(v_feat)
+                        v_pred = v_if.predict(v_feat)
+                        v_mask = v_pred == -1
+                    except Exception:
+                        v_mask = np.zeros(len(v_feat), dtype=bool)
+                    if v_mask.any():
+                        v_store = st.session_state["anoms"][method]["volume"]
+                        for ts_val, v_val, is_anom in zip(dfd["ts"], dfd["volume"], v_mask):
+                            if is_anom:
+                                v_store[float(ts_val)] = float(v_val)
     else:
         # Prophet-based residual anomalies
         Prophet = None
@@ -312,22 +402,26 @@ def _render_ohlcv_list():
                 np = None  # type: ignore
 
             if np is not None:
-                p_flags = _prophet_flags(df["dt"], df["price"]) 
+                p_flags = _prophet_flags(dfd["dt"], dfd["price"]) 
                 if p_flags.any():
                     mask = p_flags == 1
-                    for ts_val, y_val in zip(df.loc[mask, "ts"], df.loc[mask, "price"]):
-                        st.session_state["price_anoms"][float(ts_val)] = float(y_val)
+                    store = st.session_state["anoms"][method]["price"]
+                    for ts_val, y_val in zip(dfd.loc[mask, "ts"], dfd.loc[mask, "price"]):
+                        store[float(ts_val)] = float(y_val)
 
                 # Volume flags
-                v_flags = _prophet_flags(df["dt"], df["volume"]) 
+                v_flags = _prophet_flags(dfd["dt"], dfd["volume"]) 
                 if v_flags.any():
                     mask_v = v_flags == 1
-                    for ts_val, y_val in zip(df.loc[mask_v, "ts"], df.loc[mask_v, "volume"]):
-                        st.session_state["volume_anoms"][float(ts_val)] = float(y_val)
+                    store = st.session_state["anoms"][method]["volume"]
+                    for ts_val, y_val in zip(dfd.loc[mask_v, "ts"], dfd.loc[mask_v, "volume"]):
+                        store[float(ts_val)] = float(y_val)
 
     # After updating anomaly stores, draw all accumulated anomalies
-    price_store = st.session_state.get("price_anoms", {})
-    vol_store = st.session_state.get("volume_anoms", {})
+    method_stores = st.session_state.get("anoms", {})
+    current_store = method_stores.get(method, {"price": {}, "volume": {}})
+    price_store = current_store.get("price", {})
+    vol_store = current_store.get("volume", {})
     price_count = len(price_store)
     vol_count = len(vol_store)
 
@@ -335,10 +429,21 @@ def _render_ohlcv_list():
     name_suffix = {
         "Z-Score": "z-score",
         "Abs-Mean+3Std": "abs+3σ",
+        "Isolation Forest": "iForest",
         "Model (Prophet)": "model",
     }
-    price_color = {"Z-Score": "#9c27b0", "Abs-Mean+3Std": "#9c27b0", "Model (Prophet)": "#009688"}.get(method, "#9c27b0")
-    vol_color = {"Z-Score": "#ff8f00", "Abs-Mean+3Std": "#ff8f00", "Model (Prophet)": "#ff7043"}.get(method, "#ff8f00")
+    price_color = {
+        "Z-Score": "#9c27b0",
+        "Abs-Mean+3Std": "#9c27b0",
+        "Isolation Forest": "#3f51b5",
+        "Model (Prophet)": "#009688",
+    }.get(method, "#9c27b0")
+    vol_color = {
+        "Z-Score": "#ff8f00",
+        "Abs-Mean+3Std": "#ff8f00",
+        "Isolation Forest": "#f57c00",
+        "Model (Prophet)": "#ff7043",
+    }.get(method, "#ff8f00")
 
     if price_store:
         p_ts = list(price_store.keys())
