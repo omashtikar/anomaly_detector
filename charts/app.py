@@ -93,6 +93,15 @@ st.session_state.ws_url = st.text_input(
     placeholder="ws://localhost:8765 or wss://example.com/stream",
 )
 
+# Anomaly detection method selector
+anom_method = st.selectbox(
+    "Anomaly detection method",
+    options=["Z-Score", "Model (Prophet)"],
+    index=0,
+    help="Choose how anomalies are detected on price and volume.",
+)
+st.session_state["anom_method"] = anom_method
+
 col1, col2 = st.columns(2)
 
 
@@ -174,8 +183,15 @@ def _render_ohlcv_list():
     df = df.sort_values("ts")
     df["dt"] = pd.to_datetime(df["ts"], unit="s")
 
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    # Price line
+    # Two-row layout: price (top), volume bars (bottom)
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        row_heights=[0.72, 0.28],
+    )
+    # Price line (row 1)
     fig.add_trace(
         go.Scatter(
             x=df["dt"],
@@ -184,71 +200,161 @@ def _render_ohlcv_list():
             name="Price",
             line=dict(color="#1976d2", width=2),
         ),
-        secondary_y=False,
+        row=1,
+        col=1,
     )
-    # Volume line (secondary axis)
+    # Volume bars (row 2), colored by price tick direction
+    try:
+        dir_series = (df["price"].diff().fillna(0)).apply(lambda x: 1 if x >= 0 else -1)
+    except Exception:
+        dir_series = pd.Series([1] * len(df), index=df.index)
+    vol_colors = dir_series.map({1: "#26a69a", -1: "#ef5350"}).tolist()
     fig.add_trace(
-        go.Scatter(
+        go.Bar(
             x=df["dt"],
             y=df["volume"],
-            mode="lines",
+            marker_color=vol_colors,
             name="Volume",
-            line=dict(color="#8e24aa", width=1),
+            opacity=0.8,
         ),
-        secondary_y=True,
+        row=2,
+        col=1,
     )
 
     # Z-score anomaly markers for price and volume
     price_count = 0
     vol_count = 0
 
-    if detect_price_anomalies_zscore:
-        price_flags = detect_price_anomalies_zscore(df["price"].tolist())
-        if price_flags:
-            mask = pd.Series(price_flags[: len(df)]) == 1
-            if mask.any():
-                price_count = int(mask.sum())
-                fig.add_trace(
-                    go.Scatter(
-                        x=df.loc[mask, "dt"],
-                        y=df.loc[mask, "price"],
-                        mode="markers",
-                        name="Price anomaly",
-                        marker=dict(color="#9c27b0", size=11, symbol="circle", line=dict(color="#1b1b1b", width=1)),
-                        hovertemplate="Price anomaly: %{y:.4f}<extra></extra>",
-                    ),
-                    secondary_y=False,
-                )
-                # Add subtle vlines at anomaly timestamps for visibility
-                for x_val in df.loc[mask, "dt"]:
-                    fig.add_vline(x=x_val, line_color="#9c27b0", opacity=0.15)
+    method = st.session_state.get("anom_method", "Z-Score")
+    if method == "Z-Score":
+        # Z-score based detection on tick-to-tick returns
+        if detect_price_anomalies_zscore:
+            price_flags = detect_price_anomalies_zscore(df["price"].tolist())
+            if price_flags:
+                mask = pd.Series(price_flags[: len(df)]) == 1
+                if mask.any():
+                    price_count = int(mask.sum())
+                    fig.add_trace(
+                        go.Scatter(
+                            x=df.loc[mask, "dt"],
+                            y=df.loc[mask, "price"],
+                            mode="markers",
+                            name="Price anomaly (z-score)",
+                            marker=dict(color="#9c27b0", size=11, symbol="circle", line=dict(color="#1b1b1b", width=1)),
+                            hovertemplate="Price anomaly: %{y:.4f}<extra></extra>",
+                        ),
+                        row=1,
+                        col=1,
+                    )
+                    for x_val in df.loc[mask, "dt"]:
+                        fig.add_vline(x=x_val, line_color="#9c27b0", opacity=0.15, row=1, col=1)
 
-    if detect_volume_anomalies_zscore:
-        vol_flags = detect_volume_anomalies_zscore(df["volume"].tolist())
-        if vol_flags:
-            mask_v = pd.Series(vol_flags[: len(df)]) == 1
-            if mask_v.any():
-                vol_count = int(mask_v.sum())
-                fig.add_trace(
-                    go.Scatter(
-                        x=df.loc[mask_v, "dt"],
-                        y=df.loc[mask_v, "volume"],
-                        mode="markers",
-                        name="Volume anomaly",
-                        marker=dict(color="#ff8f00", size=10, symbol="diamond", line=dict(color="#1b1b1b", width=1)),
-                        hovertemplate="Volume anomaly: %{y:.0f}<extra></extra>",
-                    ),
-                    secondary_y=True,
-                )
-                for x_val in df.loc[mask_v, "dt"]:
-                    fig.add_vline(x=x_val, line_color="#ff8f00", opacity=0.12, line_dash="dot")
+        if detect_volume_anomalies_zscore:
+            vol_flags = detect_volume_anomalies_zscore(df["volume"].tolist())
+            if vol_flags:
+                mask_v = pd.Series(vol_flags[: len(df)]) == 1
+                if mask_v.any():
+                    vol_count = int(mask_v.sum())
+                    fig.add_trace(
+                        go.Scatter(
+                            x=df.loc[mask_v, "dt"],
+                            y=df.loc[mask_v, "volume"],
+                            mode="markers",
+                            name="Volume anomaly (z-score)",
+                            marker=dict(color="#ff8f00", size=10, symbol="diamond", line=dict(color="#1b1b1b", width=1)),
+                            hovertemplate="Volume anomaly: %{y:.0f}<extra></extra>",
+                        ),
+                        row=2,
+                        col=1,
+                    )
+                    for x_val in df.loc[mask_v, "dt"]:
+                        fig.add_vline(x=x_val, line_color="#ff8f00", opacity=0.12, line_dash="dot", row=2, col=1)
+    else:
+        # Prophet-based residual anomalies
+        Prophet = None
+        try:
+            from prophet import Prophet as _Prophet  # type: ignore
+            Prophet = _Prophet
+        except Exception:
+            try:
+                from fbprophet import Prophet as _Prophet  # type: ignore
+                Prophet = _Prophet
+            except Exception:
+                Prophet = None
+
+        if Prophet is None:
+            error_placeholder.info("Model (Prophet) not available. Install 'prophet' to enable model-based anomalies.")
+        else:
+            # Helper to compute residual-based flags on a single series
+            def _prophet_flags(series_dt: pd.Series, series_y: pd.Series) -> pd.Series:
+                min_points = 30
+                if len(series_y) < min_points:
+                    return pd.Series([0] * len(series_y), index=series_y.index)
+                df_p = pd.DataFrame({"ds": series_dt, "y": series_y})
+                try:
+                    m = Prophet(daily_seasonality=False, weekly_seasonality=False, yearly_seasonality=False)
+                    m.fit(df_p)
+                    yhat_df = m.predict(df_p[["ds"]])
+                    resid = df_p["y"].values - yhat_df["yhat"].values
+                    abs_resid = np.abs(resid)
+                    thr = abs_resid.mean() + 3 * abs_resid.std()
+                    flags = (abs_resid > thr).astype(int)
+                    return pd.Series(flags, index=series_y.index)
+                except Exception:
+                    return pd.Series([0] * len(series_y), index=series_y.index)
+
+            # Price flags
+            try:
+                import numpy as np  # local import for std/mean
+            except Exception:
+                np = None  # type: ignore
+
+            if np is not None:
+                p_flags = _prophet_flags(df["dt"], df["price"])
+                if p_flags.any():
+                    mask = p_flags == 1
+                    price_count = int(mask.sum())
+                    fig.add_trace(
+                        go.Scatter(
+                            x=df.loc[mask, "dt"],
+                            y=df.loc[mask, "price"],
+                            mode="markers",
+                            name="Price anomaly (model)",
+                            marker=dict(color="#009688", size=11, symbol="circle", line=dict(color="#1b1b1b", width=1)),
+                            hovertemplate="Price anomaly: %{y:.4f}<extra></extra>",
+                        ),
+                        row=1,
+                        col=1,
+                    )
+                    for x_val in df.loc[mask, "dt"]:
+                        fig.add_vline(x=x_val, line_color="#009688", opacity=0.15, row=1, col=1)
+
+                # Volume flags
+                v_flags = _prophet_flags(df["dt"], df["volume"])
+                if v_flags.any():
+                    mask_v = v_flags == 1
+                    vol_count = int(mask_v.sum())
+                    fig.add_trace(
+                        go.Scatter(
+                            x=df.loc[mask_v, "dt"],
+                            y=df.loc[mask_v, "volume"],
+                            mode="markers",
+                            name="Volume anomaly (model)",
+                            marker=dict(color="#ff7043", size=10, symbol="diamond", line=dict(color="#1b1b1b", width=1)),
+                            hovertemplate="Volume anomaly: %{y:.0f}<extra></extra>",
+                        ),
+                        row=2,
+                        col=1,
+                    )
+                    for x_val in df.loc[mask_v, "dt"]:
+                        fig.add_vline(x=x_val, line_color="#ff7043", opacity=0.12, line_dash="dot", row=2, col=1)
 
     fig.update_layout(
         margin=dict(l=10, r=10, t=20, b=10),
-        xaxis_title="Time",
+        xaxis_title=None,
         yaxis_title="Price",
         yaxis2_title="Volume",
-        height=520,
+        height=640,
         legend_tracegroupgap=6,
     )
     bars_placeholder.plotly_chart(fig, use_container_width=True)
