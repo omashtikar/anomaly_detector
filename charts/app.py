@@ -27,10 +27,14 @@ try:
     from utils import (
         detect_price_anomalies_zscore,
         detect_volume_anomalies_zscore,
+        detect_price_anomalies_absmean3std,
+        detect_volume_anomalies_absmean3std,
     )
 except Exception:
     detect_price_anomalies_zscore = None
     detect_volume_anomalies_zscore = None
+    detect_price_anomalies_absmean3std = None
+    detect_volume_anomalies_absmean3std = None
 
 
 # ----- CLI args -----
@@ -51,6 +55,8 @@ st.session_state.setdefault("ws_stop_event", threading.Event())
 st.session_state.setdefault("ws_url", args.ws)
 st.session_state.setdefault("ws_status", "disconnected")
 st.session_state.setdefault("ws_error", None)
+st.session_state.setdefault("price_anoms", {})  # ts -> price
+st.session_state.setdefault("volume_anoms", {}) # ts -> volume
 
 
 # ----- WebSocket worker -----
@@ -84,25 +90,10 @@ def ws_worker(url: str, out_q: queue.Queue, stop_event: threading.Event):
 
 
 # ----- UI -----
-st.title("WebSocket Collector")
-st.caption("Connects to a WebSocket, collects messages, and shows live price and volume lines.")
-
-st.session_state.ws_url = st.text_input(
-    "WebSocket URL",
-    value=st.session_state.ws_url or "",
-    placeholder="ws://localhost:8765 or wss://example.com/stream",
-)
-
-# Anomaly detection method selector
-anom_method = st.selectbox(
-    "Anomaly detection method",
-    options=["Z-Score", "Model (Prophet)"],
-    index=0,
-    help="Choose how anomalies are detected on price and volume.",
-)
-st.session_state["anom_method"] = anom_method
-
-col1, col2 = st.columns(2)
+left_col, right_col = st.columns([1, 3])
+with left_col:
+    st.title("WebSocket Collector")
+    st.caption("Connects to a WebSocket, collects messages, and shows live price and volume lines.")
 
 
 def start_ws():
@@ -128,12 +119,29 @@ def stop_ws():
     st.session_state.ws_status = "disconnected"
 
 
-with col1:
-    if st.button("Start WebSocket", type="primary", use_container_width=True):
-        start_ws()
-with col2:
-    if st.button("Stop WebSocket", use_container_width=True):
-        stop_ws()
+with left_col:
+    # Controls: URL input, detection method, start/stop
+    st.session_state.ws_url = st.text_input(
+        "WebSocket URL",
+        value=st.session_state.ws_url or "",
+        placeholder="ws://localhost:8765 or wss://example.com/stream",
+    )
+
+    anom_method = st.selectbox(
+        "Anomaly detection method",
+        options=["Z-Score", "Abs-Mean+3Std", "Model (Prophet)"],
+        index=0,
+        help="Choose how anomalies are detected on price and volume.",
+    )
+    st.session_state["anom_method"] = anom_method
+
+    btn_col1, btn_col2 = st.columns(2)
+    with btn_col1:
+        if st.button("Start WebSocket", type="primary", use_container_width=True, key="btn_start_left"):
+            start_ws()
+    with btn_col2:
+        if st.button("Stop WebSocket", use_container_width=True, key="btn_stop_left"):
+            stop_ws()
 
 
 # drain queue helper
@@ -157,11 +165,13 @@ def drain_queue():
     return updated
 
 
-# status row
-status_placeholder = st.empty()
-error_placeholder = st.empty()
-metric_placeholder = st.empty()
-bars_placeholder = st.empty()
+# status and counters on the left; chart on the right
+with left_col:
+    status_placeholder = st.empty()
+    error_placeholder = st.empty()
+    metric_placeholder = st.empty()
+with right_col:
+    bars_placeholder = st.empty()
 
 
 # ---- Tick helpers ----
@@ -232,43 +242,35 @@ def _render_ohlcv_list():
             price_flags = detect_price_anomalies_zscore(df["price"].tolist())
             if price_flags:
                 mask = pd.Series(price_flags[: len(df)]) == 1
+                # Persist newly found anomalies
                 if mask.any():
-                    price_count = int(mask.sum())
-                    fig.add_trace(
-                        go.Scatter(
-                            x=df.loc[mask, "dt"],
-                            y=df.loc[mask, "price"],
-                            mode="markers",
-                            name="Price anomaly (z-score)",
-                            marker=dict(color="#9c27b0", size=11, symbol="circle", line=dict(color="#1b1b1b", width=1)),
-                            hovertemplate="Price anomaly: %{y:.4f}<extra></extra>",
-                        ),
-                        row=1,
-                        col=1,
-                    )
-                    for x_val in df.loc[mask, "dt"]:
-                        fig.add_vline(x=x_val, line_color="#9c27b0", opacity=0.15, row=1, col=1)
+                    for ts_val, y_val in zip(df.loc[mask, "ts"], df.loc[mask, "price"]):
+                        st.session_state["price_anoms"][float(ts_val)] = float(y_val)
 
         if detect_volume_anomalies_zscore:
             vol_flags = detect_volume_anomalies_zscore(df["volume"].tolist())
             if vol_flags:
                 mask_v = pd.Series(vol_flags[: len(df)]) == 1
                 if mask_v.any():
-                    vol_count = int(mask_v.sum())
-                    fig.add_trace(
-                        go.Scatter(
-                            x=df.loc[mask_v, "dt"],
-                            y=df.loc[mask_v, "volume"],
-                            mode="markers",
-                            name="Volume anomaly (z-score)",
-                            marker=dict(color="#ff8f00", size=10, symbol="diamond", line=dict(color="#1b1b1b", width=1)),
-                            hovertemplate="Volume anomaly: %{y:.0f}<extra></extra>",
-                        ),
-                        row=2,
-                        col=1,
-                    )
-                    for x_val in df.loc[mask_v, "dt"]:
-                        fig.add_vline(x=x_val, line_color="#ff8f00", opacity=0.12, line_dash="dot", row=2, col=1)
+                    for ts_val, y_val in zip(df.loc[mask_v, "ts"], df.loc[mask_v, "volume"]):
+                        st.session_state["volume_anoms"][float(ts_val)] = float(y_val)
+    elif method == "Abs-Mean+3Std":
+        # Absolute-return threshold method: |r| > mean(|r|) + 3*std(|r|)
+        if detect_price_anomalies_absmean3std:
+            price_flags = detect_price_anomalies_absmean3std(df["price"].tolist())
+            if price_flags:
+                mask = pd.Series(price_flags[: len(df)]) == 1
+                if mask.any():
+                    for ts_val, y_val in zip(df.loc[mask, "ts"], df.loc[mask, "price"]):
+                        st.session_state["price_anoms"][float(ts_val)] = float(y_val)
+
+        if detect_volume_anomalies_absmean3std:
+            vol_flags = detect_volume_anomalies_absmean3std(df["volume"].tolist())
+            if vol_flags:
+                mask_v = pd.Series(vol_flags[: len(df)]) == 1
+                if mask_v.any():
+                    for ts_val, y_val in zip(df.loc[mask_v, "ts"], df.loc[mask_v, "volume"]):
+                        st.session_state["volume_anoms"][float(ts_val)] = float(y_val)
     else:
         # Prophet-based residual anomalies
         Prophet = None
@@ -310,44 +312,71 @@ def _render_ohlcv_list():
                 np = None  # type: ignore
 
             if np is not None:
-                p_flags = _prophet_flags(df["dt"], df["price"])
+                p_flags = _prophet_flags(df["dt"], df["price"]) 
                 if p_flags.any():
                     mask = p_flags == 1
-                    price_count = int(mask.sum())
-                    fig.add_trace(
-                        go.Scatter(
-                            x=df.loc[mask, "dt"],
-                            y=df.loc[mask, "price"],
-                            mode="markers",
-                            name="Price anomaly (model)",
-                            marker=dict(color="#009688", size=11, symbol="circle", line=dict(color="#1b1b1b", width=1)),
-                            hovertemplate="Price anomaly: %{y:.4f}<extra></extra>",
-                        ),
-                        row=1,
-                        col=1,
-                    )
-                    for x_val in df.loc[mask, "dt"]:
-                        fig.add_vline(x=x_val, line_color="#009688", opacity=0.15, row=1, col=1)
+                    for ts_val, y_val in zip(df.loc[mask, "ts"], df.loc[mask, "price"]):
+                        st.session_state["price_anoms"][float(ts_val)] = float(y_val)
 
                 # Volume flags
-                v_flags = _prophet_flags(df["dt"], df["volume"])
+                v_flags = _prophet_flags(df["dt"], df["volume"]) 
                 if v_flags.any():
                     mask_v = v_flags == 1
-                    vol_count = int(mask_v.sum())
-                    fig.add_trace(
-                        go.Scatter(
-                            x=df.loc[mask_v, "dt"],
-                            y=df.loc[mask_v, "volume"],
-                            mode="markers",
-                            name="Volume anomaly (model)",
-                            marker=dict(color="#ff7043", size=10, symbol="diamond", line=dict(color="#1b1b1b", width=1)),
-                            hovertemplate="Volume anomaly: %{y:.0f}<extra></extra>",
-                        ),
-                        row=2,
-                        col=1,
-                    )
-                    for x_val in df.loc[mask_v, "dt"]:
-                        fig.add_vline(x=x_val, line_color="#ff7043", opacity=0.12, line_dash="dot", row=2, col=1)
+                    for ts_val, y_val in zip(df.loc[mask_v, "ts"], df.loc[mask_v, "volume"]):
+                        st.session_state["volume_anoms"][float(ts_val)] = float(y_val)
+
+    # After updating anomaly stores, draw all accumulated anomalies
+    price_store = st.session_state.get("price_anoms", {})
+    vol_store = st.session_state.get("volume_anoms", {})
+    price_count = len(price_store)
+    vol_count = len(vol_store)
+
+    # Visual style mapping per method
+    name_suffix = {
+        "Z-Score": "z-score",
+        "Abs-Mean+3Std": "abs+3σ",
+        "Model (Prophet)": "model",
+    }
+    price_color = {"Z-Score": "#9c27b0", "Abs-Mean+3Std": "#9c27b0", "Model (Prophet)": "#009688"}.get(method, "#9c27b0")
+    vol_color = {"Z-Score": "#ff8f00", "Abs-Mean+3Std": "#ff8f00", "Model (Prophet)": "#ff7043"}.get(method, "#ff8f00")
+
+    if price_store:
+        p_ts = list(price_store.keys())
+        p_vals = [price_store[t] for t in p_ts]
+        p_dt = pd.to_datetime(p_ts, unit="s")
+        fig.add_trace(
+            go.Scatter(
+                x=p_dt,
+                y=p_vals,
+                mode="markers",
+                name=("Price anomaly (" + name_suffix.get(method, "z-score") + ")"),
+                marker=dict(color=price_color, size=13, symbol="circle", line=dict(color="#1b1b1b", width=2)),
+                hovertemplate="Price anomaly: %{y:.4f}<extra></extra>",
+            ),
+            row=1,
+            col=1,
+        )
+        for x_val in p_dt:
+            fig.add_vline(x=x_val, line_color=price_color, opacity=0.15, row=1, col=1)
+
+    if vol_store:
+        v_ts = list(vol_store.keys())
+        v_vals = [vol_store[t] for t in v_ts]
+        v_dt = pd.to_datetime(v_ts, unit="s")
+        fig.add_trace(
+            go.Scatter(
+                x=v_dt,
+                y=v_vals,
+                mode="markers",
+                name=("Volume anomaly (" + name_suffix.get(method, "z-score") + ")"),
+                marker=dict(color=vol_color, size=12, symbol="diamond", line=dict(color="#1b1b1b", width=2)),
+                hovertemplate="Volume anomaly: %{y:.0f}<extra></extra>",
+            ),
+            row=2,
+            col=1,
+        )
+        for x_val in v_dt:
+            fig.add_vline(x=x_val, line_color=vol_color, opacity=0.12, line_dash="dot", row=2, col=1)
 
     fig.update_layout(
         margin=dict(l=10, r=10, t=20, b=10),

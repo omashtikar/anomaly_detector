@@ -314,3 +314,83 @@ def detect_volume_anomalies_zscore(volumes):
     elif len(flags_aligned) > n:
         flags_aligned = flags_aligned[:n]
     return flags_aligned
+
+
+def detect_price_anomalies_absmean3std(prices):
+    """
+    Detect anomalies in tick price using absolute-return threshold:
+        |r_t| > mean(|r|) + 3 * std(|r|)
+
+    Returns a 0/1 list aligned to len(prices). First element is 0.
+    """
+    n = len(prices)
+    if n == 0:
+        return []
+    if n == 1:
+        return [0]
+
+    returns = rate_of_change(prices)
+    if not returns:
+        return [0] * n
+
+    abs_returns = [abs(r) for r in returns if r is not None]
+    if not abs_returns:
+        return [0] * n
+
+    mean_abs = float(np.mean(abs_returns))
+    std_abs = float(np.std(abs_returns))
+    thr = mean_abs + 3.0 * std_abs
+
+    flags_returns = []
+    for r in returns:
+        if r is None:
+            flags_returns.append(0)
+        else:
+            flags_returns.append(1 if abs(r) > thr else 0)
+
+    flags = [0] + flags_returns
+    if len(flags) < n:
+        flags += [0] * (n - len(flags))
+    elif len(flags) > n:
+        flags = flags[:n]
+    return flags
+
+
+def detect_volume_anomalies_absmean3std(volumes):
+    """
+    Detect anomalies in tick volume using absolute change threshold on rate-of-change:
+        |r_t| > mean(|r|) + 3 * std(|r|)
+
+    Returns a 0/1 list aligned to len(volumes). First element is 0.
+    """
+    n = len(volumes)
+    if n == 0:
+        return []
+    if n == 1:
+        return [0]
+
+    vol_returns = rate_of_change(volumes)
+    if not vol_returns:
+        return [0] * n
+
+    abs_returns = [abs(r) for r in vol_returns if r is not None]
+    if not abs_returns:
+        return [0] * n
+
+    mean_abs = float(np.mean(abs_returns))
+    std_abs = float(np.std(abs_returns))
+    thr = mean_abs + 3.0 * std_abs
+
+    flags_returns = []
+    for r in vol_returns:
+        if r is None:
+            flags_returns.append(0)
+        else:
+            flags_returns.append(1 if abs(r) > thr else 0)
+
+    flags = [0] + flags_returns
+    if len(flags) < n:
+        flags += [0] * (n - len(flags))
+    elif len(flags) > n:
+        flags = flags[:n]
+    return flags
