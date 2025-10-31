@@ -11,10 +11,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-try:
-    from ohlcv import ticks_to_ohlcv
-except Exception:
-    ticks_to_ohlcv = None
+# No OHLCV aggregation is used; we render tick lines directly
 
 try:
     from websocket import WebSocketApp
