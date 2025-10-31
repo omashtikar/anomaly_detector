@@ -23,10 +23,17 @@ except ImportError:
 
 # Anomaly utils
 try:
-    from utils import rate_of_change, detect_anomalies_zscore
+    from utils import (
+        rate_of_change,
+        detect_anomalies_zscore,
+        rate_of_change_open,
+        detect_open_anomalies_zscore,
+    )
 except Exception:
     rate_of_change = None
     detect_anomalies_zscore = None
+    rate_of_change_open = None
+    detect_open_anomalies_zscore = None
 
 
 # ----- CLI args -----
@@ -47,6 +54,7 @@ st.session_state.setdefault("ws_stop_event", threading.Event())
 st.session_state.setdefault("ws_url", args.ws)
 st.session_state.setdefault("ws_status", "disconnected")
 st.session_state.setdefault("ws_error", None)
+st.session_state.setdefault("last_completed_bar_start", None)
 
 
 # ----- WebSocket worker -----
@@ -172,6 +180,23 @@ def _render_ohlcv_list():
         # Compute end timestamp for band highlighting (interval is 10s above)
         df["end_dt"] = pd.to_datetime(df["start"] + 10, unit="s")
 
+        # Only include fully completed candles in the render (exclude the current in-progress bucket)
+        now_dt = pd.to_datetime(int(time.time()), unit="s")
+        df_completed = df[df["end_dt"] <= now_dt].copy()
+
+        if df_completed.empty:
+            bars_placeholder.info("Waiting for completed candles...")
+            return
+
+        # If no newly completed candle since last render, skip updating chart
+        last_completed_start = int(df_completed["start"].max())
+        if st.session_state.get("last_completed_bar_start") == last_completed_start:
+            return
+        st.session_state["last_completed_bar_start"] = last_completed_start
+
+        # Work with completed bars only for plotting
+        df = df_completed
+
         fig = go.Figure(
             data=[
                 go.Candlestick(
@@ -186,6 +211,9 @@ def _render_ohlcv_list():
                 )
             ]
         )
+
+        # Baseline for anomaly dots along the bottom of the chart
+        y_baseline = float(df["low"].min())
 
         # ---- Anomaly overlay using close-to-close returns ----
         if rate_of_change and detect_anomalies_zscore:
@@ -208,7 +236,8 @@ def _render_ohlcv_list():
                 fig.add_trace(
                     go.Scatter(
                         x=x_anom,
-                        y=y_anom,
+                        y=[y_baseline] * len(x_anom),
+                        customdata=y_anom,
                         mode="markers",
                         marker=dict(
                             symbol="circle",
@@ -217,23 +246,43 @@ def _render_ohlcv_list():
                             line=dict(width=1, color="#1b1b1b"),
                         ),
                         name="Close anomaly",
-                        hovertemplate="Anomaly close: %{y:.4f}<extra></extra>",
+                        hovertemplate="Anomaly close: %{customdata:.4f}<extra></extra>",
                     )
                 )
 
-                # Add a single arrow pointing at the close to highlight it
-                for x_val, y_val in zip(x_anom, y_anom):
-                    fig.add_annotation(
-                        x=x_val,
-                        y=y_val,
-                        text="",
-                        showarrow=True,
-                        arrowhead=2,
-                        arrowsize=1,
-                        arrowcolor=anom_color,
-                        ax=0,
-                        ay=-30,  # draw arrow from a bit above down to the close
+                # Arrows removed per request; keep only bottom dots
+
+        # ---- Anomaly overlay using open-to-open returns ----
+        if rate_of_change_open and detect_open_anomalies_zscore:
+            opens = df["open"].tolist()
+            open_flags = detect_open_anomalies_zscore(opens)
+            if len(open_flags) < len(df):
+                open_flags += [0] * (len(df) - len(open_flags))
+            df["anomaly_open"] = open_flags[: len(df)]
+            mask_open = df["anomaly_open"] == 1
+            if mask_open.any():
+                open_color = "#1976d2"  # blue for open anomalies
+                x_open = df.loc[mask_open, "start_dt"]
+                y_open = df.loc[mask_open, "open"]
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=x_open,
+                        y=[y_baseline] * len(x_open),
+                        customdata=y_open,
+                        mode="markers",
+                        marker=dict(
+                            symbol="circle",
+                            size=10,
+                            color=open_color,
+                            line=dict(width=1, color="#1b1b1b"),
+                        ),
+                        name="Open anomaly",
+                        hovertemplate="Anomaly open: %{customdata:.4f}<extra></extra>",
                     )
+                )
+
+                # Arrows removed per request; keep only bottom dots
 
         fig.update_layout(
             margin=dict(l=10, r=10, t=20, b=10),
