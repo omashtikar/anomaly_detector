@@ -100,10 +100,21 @@ def jd_price_volume_stream(params: JDParams) -> Iterator[Dict[str, Any]]:
                 r += move
         S *= math.exp(r)
 
-        # ----- Volume: seasonality + AR(1) + volatility and jump sensitivity -----
+        # ----- Volume: multiplicative seasonality + mean-reverting AR(1) around seasonal mean -----
+        # Compute seasonal multiplier in [~0.5, 1.0] and mean log-volume for this tick
         season = u_shape_profile(t_norm)
+        logV_mean = math.log(max(params.v0, 1.0)) + math.log(max(season, 1e-6))
+
+        # Mean-reversion of log-volume to the seasonal mean rather than to absolute previous value.
+        # This avoids the "huge at start then tiny" artifact and yields comparable volumes over time.
         eps_v = rng.normal(0.0, params.sigma_v)
-        logV = season + params.phi * logV + params.beta * abs(r) + (params.gamma if has_jump else 0.0) + eps_v
+        logV = (
+            logV_mean
+            + params.phi * (logV - logV_mean)  # AR(1) around seasonal mean
+            + params.beta * abs(r)             # sensitivity to absolute price move
+            + (params.gamma if has_jump else 0.0)  # jump bump
+            + eps_v
+        )
 
         # Amplify volume during anomalies
         if has_anom:
