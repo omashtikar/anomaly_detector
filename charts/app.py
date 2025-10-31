@@ -169,6 +169,8 @@ def _render_ohlcv_list():
         df = pd.DataFrame(bars)[["start", "open", "high", "low", "close", "volume"]]
         df = df.sort_values("start")
         df["start_dt"] = pd.to_datetime(df["start"], unit="s")
+        # Compute end timestamp for band highlighting (interval is 10s above)
+        df["end_dt"] = pd.to_datetime(df["start"] + 10, unit="s")
 
         fig = go.Figure(
             data=[
@@ -198,15 +200,40 @@ def _render_ohlcv_list():
             df["anomaly"] = flags[: len(df)]
             mask = df["anomaly"] == 1
             if mask.any():
+                # Highlight the close price of anomalous bars with a colored marker
+                anom_color = "#9c27b0"  # distinctive color for close anomalies (purple)
+                x_anom = df.loc[mask, "start_dt"]
+                y_anom = df.loc[mask, "close"]
+
                 fig.add_trace(
                     go.Scatter(
-                        x=df.loc[mask, "start_dt"],
-                        y=df.loc[mask, "close"],
+                        x=x_anom,
+                        y=y_anom,
                         mode="markers",
-                        marker=dict(symbol="triangle-up", size=10, color="#ffa726", line=dict(width=1, color="#6d4c41")),
-                        name="Anomaly",
+                        marker=dict(
+                            symbol="circle",
+                            size=10,
+                            color=anom_color,
+                            line=dict(width=1, color="#1b1b1b"),
+                        ),
+                        name="Close anomaly",
+                        hovertemplate="Anomaly close: %{y:.4f}<extra></extra>",
                     )
                 )
+
+                # Add a single arrow pointing at the close to highlight it
+                for x_val, y_val in zip(x_anom, y_anom):
+                    fig.add_annotation(
+                        x=x_val,
+                        y=y_val,
+                        text="",
+                        showarrow=True,
+                        arrowhead=2,
+                        arrowsize=1,
+                        arrowcolor=anom_color,
+                        ax=0,
+                        ay=-30,  # draw arrow from a bit above down to the close
+                    )
 
         fig.update_layout(
             margin=dict(l=10, r=10, t=20, b=10),
