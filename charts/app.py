@@ -186,7 +186,6 @@ params = st.session_state["sim_params"]
 left_col, right_col = st.columns([1, 3])
 with left_col:
     st.title("Anomaly Dashboard")
-    st.caption("Generate synthetic ticks and watch the anomaly detectors react in real time.")
 
     with st.container():
         current_method = st.session_state.get("anom_method", ANOM_METHODS[0])
@@ -233,9 +232,8 @@ with left_col:
                 key="rolling_n",
                 help="Number of ticks considered when the rolling window is enabled.",
             )
-            st.info("Rolling window ON: anomaly detection uses only the most recent N ticks.")
         else:
-            st.info("Rolling window OFF: anomaly detection uses all collected ticks.")
+            pass
 
     status_placeholder = st.empty()
     sim_error_placeholder = st.empty()
@@ -288,7 +286,7 @@ with left_col:
             )
         )
 
-        st.divider()
+        st.markdown("**Advanced parameters:**")
 
         col_jump1, col_jump2 = st.columns(2)
         params["jump_lambda"] = float(
@@ -440,6 +438,8 @@ def _render_ohlcv_list():
     if not ticks:
         bars_placeholder.info("Waiting for tick data...")
         return
+
+    chart_area = bars_placeholder.empty()
 
     df = pd.DataFrame(ticks)[["ts", "price", "volume"]]
     df = df.sort_values("ts")
@@ -691,7 +691,7 @@ def _render_ohlcv_list():
         height=640,
         legend_tracegroupgap=6,
     )
-    bars_placeholder.plotly_chart(fig, use_container_width=True)
+    chart_area.plotly_chart(fig, use_container_width=True)
 
     try:
         c1, c2 = metric_placeholder.columns(2)
@@ -700,8 +700,6 @@ def _render_ohlcv_list():
     except Exception:
         metric_placeholder.write(f"Price anomalies: {price_count} | Volume anomalies: {vol_count}")
 
-
-live = st.toggle("Live update", value=True, help="Continuously refresh the chart while the simulator runs.")
 
 drain_queue()
 ticks_len = len(_ticks_only())
@@ -717,7 +715,7 @@ else:
 
 _render_ohlcv_list()
 
-if live and st.session_state["sim_status"] in {"starting", "running", "stopping"}:
+if st.session_state["sim_status"] in {"starting", "running", "stopping"}:
     for _ in range(1200):
         changed = drain_queue()
         if changed:
