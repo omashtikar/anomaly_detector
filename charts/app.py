@@ -3,7 +3,7 @@ import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 import sys
 
 import pandas as pd
@@ -70,6 +70,8 @@ if "max_points" not in st.session_state:
 st.session_state.setdefault("anom_method", ANOM_METHODS[0])
 st.session_state.setdefault("rolling_on", False)
 st.session_state.setdefault("rolling_n", 20)
+st.session_state.setdefault("refresh_interval", 0.5)
+st.session_state.setdefault("chart_rendered", False)
 
 
 def build_params_from_state() -> JDParams:
@@ -115,6 +117,7 @@ def start_sim() -> None:
     st.session_state["messages"] = []
     st.session_state["anoms"] = fresh_anom_store()
     st.session_state["feed_queue"] = queue.Queue()
+    st.session_state["chart_rendered"] = False
 
     stop_event = threading.Event()
     st.session_state["sim_stop_event"] = stop_event
@@ -141,6 +144,7 @@ def stop_sim() -> None:
     else:
         st.session_state["sim_status"] = "stopped"
         st.session_state["sim_thread"] = None
+    st.session_state["chart_rendered"] = False
 
 
 def drain_queue() -> int:
@@ -181,6 +185,186 @@ def _ticks_only():
     ]
 
 
+def update_anomaly_store_for_df(
+    df: pd.DataFrame,
+    method: str,
+    rolling_on: bool,
+    rolling_n: int,
+    notice_placeholder: Optional["st.delta_generator.DeltaGenerator"] = None,
+    reset: bool = False,
+):
+    st.session_state.setdefault("anoms", fresh_anom_store())
+    if reset or method not in st.session_state["anoms"]:
+        st.session_state["anoms"][method] = {"price": {}, "volume": {}}
+
+    store = st.session_state["anoms"][method]
+    price_store = store["price"]
+    vol_store = store["volume"]
+
+    if reset:
+        price_store.clear()
+        vol_store.clear()
+
+    if df.empty:
+        return price_store, vol_store
+
+    window_n = int(rolling_n or 1)
+    window_n = max(1, window_n)
+    dfd = df.tail(window_n) if rolling_on else df
+
+    if method == "Z-Score":
+        if detect_price_anomalies_zscore:
+            price_flags = detect_price_anomalies_zscore(dfd["price"].tolist())
+            if price_flags:
+                mask = pd.Series(price_flags[: len(dfd)], index=dfd.index) == 1
+                if mask.any():
+                    for ts_val, y_val in zip(dfd.loc[mask, "ts"], dfd.loc[mask, "price"]):
+                        price_store[float(ts_val)] = float(y_val)
+
+        if detect_volume_anomalies_zscore:
+            vol_flags = detect_volume_anomalies_zscore(dfd["volume"].tolist())
+            if vol_flags:
+                mask_v = pd.Series(vol_flags[: len(dfd)], index=dfd.index) == 1
+                if mask_v.any():
+                    for ts_val, y_val in zip(dfd.loc[mask_v, "ts"], dfd.loc[mask_v, "volume"]):
+                        vol_store[float(ts_val)] = float(y_val)
+
+    elif method == "Abs-Mean+3Std":
+        if detect_price_anomalies_absmean3std:
+            price_flags = detect_price_anomalies_absmean3std(dfd["price"].tolist())
+            if price_flags:
+                mask = pd.Series(price_flags[: len(dfd)], index=dfd.index) == 1
+                if mask.any():
+                    for ts_val, y_val in zip(dfd.loc[mask, "ts"], dfd.loc[mask, "price"]):
+                        price_store[float(ts_val)] = float(y_val)
+
+        if detect_volume_anomalies_absmean3std:
+            vol_flags = detect_volume_anomalies_absmean3std(dfd["volume"].tolist())
+            if vol_flags:
+                mask_v = pd.Series(vol_flags[: len(dfd)], index=dfd.index) == 1
+                if mask_v.any():
+                    for ts_val, y_val in zip(dfd.loc[mask_v, "ts"], dfd.loc[mask_v, "volume"]):
+                        vol_store[float(ts_val)] = float(y_val)
+
+    elif method == "Isolation Forest":
+        if len(dfd) >= 10:
+            try:
+                import numpy as np  # type: ignore
+                from sklearn.ensemble import IsolationForest  # type: ignore
+            except Exception:
+                if notice_placeholder is not None:
+                    notice_placeholder.info("Isolation Forest not available. Install scikit-learn to enable it.")
+            else:
+                p_vals = dfd["price"].to_numpy(dtype=float)
+                if p_vals.size:
+                    p_mu = float(np.mean(p_vals))
+                    p_sigma = float(np.std(p_vals)) or 1.0
+                    p_feat = ((p_vals - p_mu) / p_sigma).reshape(-1, 1)
+                    try:
+                        p_if = IsolationForest(n_estimators=100, contamination=0.005, random_state=42)
+                        p_if.fit(p_feat)
+                        p_pred = p_if.predict(p_feat)
+                        p_mask = p_pred == -1
+                    except Exception:
+                        p_mask = np.zeros(len(p_feat), dtype=bool)
+                    if p_mask.any():
+                        for ts_val, p_val, is_anom in zip(dfd["ts"], dfd["price"], p_mask):
+                            if is_anom:
+                                price_store[float(ts_val)] = float(p_val)
+
+                v_vals = dfd["volume"].to_numpy(dtype=float)
+                if v_vals.size:
+                    v_mu = float(np.mean(v_vals))
+                    v_sigma = float(np.std(v_vals)) or 1.0
+                    v_feat = ((v_vals - v_mu) / v_sigma).reshape(-1, 1)
+                    try:
+                        v_if = IsolationForest(n_estimators=100, contamination=0.005, random_state=42)
+                        v_if.fit(v_feat)
+                        v_pred = v_if.predict(v_feat)
+                        v_mask = v_pred == -1
+                    except Exception:
+                        v_mask = np.zeros(len(v_feat), dtype=bool)
+                    if v_mask.any():
+                        for ts_val, v_val, is_anom in zip(dfd["ts"], dfd["volume"], v_mask):
+                            if is_anom:
+                                vol_store[float(ts_val)] = float(v_val)
+        else:
+            if notice_placeholder is not None:
+                notice_placeholder.info("Isolation Forest needs at least 10 ticks to warm up.")
+
+    else:
+        try:
+            from prophet import Prophet as _Prophet  # type: ignore
+        except Exception:
+            try:
+                from fbprophet import Prophet as _Prophet  # type: ignore
+            except Exception:
+                _Prophet = None
+
+        if _Prophet is None:
+            if notice_placeholder is not None:
+                notice_placeholder.info("Model (Prophet) not available. Install 'prophet' to enable it.")
+        else:
+            def _prophet_flags(series_dt: pd.Series, series_y: pd.Series) -> pd.Series:
+                min_points = 30
+                if len(series_y) < min_points:
+                    return pd.Series([0] * len(series_y), index=series_y.index)
+                df_p = pd.DataFrame({"ds": series_dt, "y": series_y})
+                try:
+                    m = _Prophet(daily_seasonality=False, weekly_seasonality=False, yearly_seasonality=False)
+                    m.fit(df_p)
+                    yhat_df = m.predict(df_p[["ds"]])
+                    resid = df_p["y"].values - yhat_df["yhat"].values
+                    import numpy as np  # type: ignore
+
+                    abs_resid = np.abs(resid)
+                    thr = abs_resid.mean() + 3 * abs_resid.std()
+                    flags = (abs_resid > thr).astype(int)
+                    return pd.Series(flags, index=series_y.index)
+                except Exception:
+                    return pd.Series([0] * len(series_y), index=series_y.index)
+
+            try:
+                import numpy as np  # type: ignore
+            except Exception:
+                np = None  # type: ignore
+
+            if np is not None:
+                p_flags = _prophet_flags(dfd["dt"], dfd["price"])
+                if p_flags.any():
+                    mask = p_flags == 1
+                    for ts_val, y_val in zip(dfd.loc[mask, "ts"], dfd.loc[mask, "price"]):
+                        price_store[float(ts_val)] = float(y_val)
+
+                v_flags = _prophet_flags(dfd["dt"], dfd["volume"])
+                if v_flags.any():
+                    mask_v = v_flags == 1
+                    for ts_val, y_val in zip(dfd.loc[mask_v, "ts"], dfd.loc[mask_v, "volume"]):
+                        vol_store[float(ts_val)] = float(y_val)
+
+    return price_store, vol_store
+
+
+def recompute_full_anomalies(method: str) -> None:
+    st.session_state.setdefault("anoms", fresh_anom_store())
+    ticks = _ticks_only()
+    if not ticks:
+        st.session_state["anoms"][method] = {"price": {}, "volume": {}}
+        return
+
+    df = pd.DataFrame(ticks)[["ts", "price", "volume"]]
+    df = df.sort_values("ts")
+    df["dt"] = pd.to_datetime(df["ts"], unit="s")
+    update_anomaly_store_for_df(
+        df,
+        method,
+        rolling_on=False,
+        rolling_n=len(df),
+        notice_placeholder=None,
+        reset=True,
+    )
+
+
 params = st.session_state["sim_params"]
 
 left_col, right_col = st.columns([1, 3])
@@ -200,13 +384,25 @@ with left_col:
             index=default_idx,
             help="Choose the algorithm used to highlight price and volume anomalies.",
         )
-        st.session_state["anom_method"] = anom_method
+
+        if anom_method != st.session_state.get("anom_method"):
+            st.session_state["anom_method"] = anom_method
+            stop_sim()
+            drain_queue()
+            with st.spinner("Recomputing anomalies..."):
+                recompute_full_anomalies(anom_method)
+            st.session_state["chart_rendered"] = False
 
         btn_col1, btn_col2 = st.columns(2)
-        if btn_col1.button("Start simulator", type="primary", use_container_width=True):
+        sim_status = st.session_state.get("sim_status", "stopped")
+        start_label = "Resume simulator" if sim_status not in {"stopped", "error"} else "Start simulator"
+        if btn_col1.button(start_label, type="primary", use_container_width=True):
             start_sim()
         if btn_col2.button("Stop simulator", use_container_width=True):
             stop_sim()
+
+        if st.session_state.get("sim_status") == "stopped":
+            st.caption("Simulator paused. Click Start simulator to stream new ticks.")
 
         max_points_input = st.number_input(
             "Max ticks to keep",
@@ -232,8 +428,16 @@ with left_col:
                 key="rolling_n",
                 help="Number of ticks considered when the rolling window is enabled.",
             )
-        else:
-            pass
+
+        refresh_val = st.number_input(
+            "Screen refresh rate (seconds)",
+            min_value=0.1,
+            max_value=5.0,
+            step=0.1,
+            value=float(st.session_state.get("refresh_interval", 0.5)),
+            help="Controls how often the chart refreshes while the simulator runs.",
+        )
+        st.session_state["refresh_interval"] = float(refresh_val)
 
     status_placeholder = st.empty()
     sim_error_placeholder = st.empty()
@@ -429,17 +633,21 @@ with left_col:
         )
 
 with right_col:
-    bars_placeholder = st.empty()
+    wait_placeholder = st.empty()
+    chart_placeholder = st.empty()
 
 
 def _render_ohlcv_list():
     notice_placeholder.empty()
     ticks = _ticks_only()
     if not ticks:
-        bars_placeholder.info("Waiting for tick data...")
+        chart_placeholder.empty()
+        with wait_placeholder:
+            st.spinner("Waiting for tick data...")
+        st.session_state["chart_rendered"] = False
         return
 
-    chart_area = bars_placeholder.empty()
+    wait_placeholder.empty()
 
     df = pd.DataFrame(ticks)[["ts", "price", "volume"]]
     df = df.sort_values("ts")
@@ -480,149 +688,18 @@ def _render_ohlcv_list():
         col=1,
     )
 
-    price_count = 0
-    vol_count = 0
-
-    rolling_on = st.session_state.get("rolling_on", False)
+    rolling_on = bool(st.session_state.get("rolling_on", False))
     rolling_n = int(st.session_state.get("rolling_n", 20) or 20)
-    dfd = df.tail(max(1, rolling_n)) if rolling_on else df
 
     method = st.session_state.get("anom_method", "Z-Score")
-    st.session_state["anoms"].setdefault(method, {"price": {}, "volume": {}})
-    if method == "Z-Score":
-        if detect_price_anomalies_zscore:
-            price_flags = detect_price_anomalies_zscore(dfd["price"].tolist())
-            if price_flags:
-                mask = pd.Series(price_flags[: len(dfd)], index=dfd.index) == 1
-                if mask.any():
-                    store = st.session_state["anoms"][method]["price"]
-                    for ts_val, y_val in zip(dfd.loc[mask, "ts"], dfd.loc[mask, "price"]):
-                        store[float(ts_val)] = float(y_val)
-
-        if detect_volume_anomalies_zscore:
-            vol_flags = detect_volume_anomalies_zscore(dfd["volume"].tolist())
-            if vol_flags:
-                mask_v = pd.Series(vol_flags[: len(dfd)], index=dfd.index) == 1
-                if mask_v.any():
-                    store = st.session_state["anoms"][method]["volume"]
-                    for ts_val, y_val in zip(dfd.loc[mask_v, "ts"], dfd.loc[mask_v, "volume"]):
-                        store[float(ts_val)] = float(y_val)
-    elif method == "Abs-Mean+3Std":
-        if detect_price_anomalies_absmean3std:
-            price_flags = detect_price_anomalies_absmean3std(dfd["price"].tolist())
-            if price_flags:
-                mask = pd.Series(price_flags[: len(dfd)], index=dfd.index) == 1
-                if mask.any():
-                    store = st.session_state["anoms"][method]["price"]
-                    for ts_val, y_val in zip(dfd.loc[mask, "ts"], dfd.loc[mask, "price"]):
-                        store[float(ts_val)] = float(y_val)
-
-        if detect_volume_anomalies_absmean3std:
-            vol_flags = detect_volume_anomalies_absmean3std(dfd["volume"].tolist())
-            if vol_flags:
-                mask_v = pd.Series(vol_flags[: len(dfd)], index=dfd.index) == 1
-                if mask_v.any():
-                    store = st.session_state["anoms"][method]["volume"]
-                    for ts_val, y_val in zip(dfd.loc[mask_v, "ts"], dfd.loc[mask_v, "volume"]):
-                        store[float(ts_val)] = float(y_val)
-    elif method == "Isolation Forest":
-        if len(dfd) >= 10:
-            try:
-                import numpy as np  # type: ignore
-                from sklearn.ensemble import IsolationForest  # type: ignore
-            except Exception:
-                notice_placeholder.info("Isolation Forest not available. Install scikit-learn to enable it.")
-            else:
-                p_vals = dfd["price"].to_numpy(dtype=float)
-                if p_vals.size:
-                    p_mu = float(np.mean(p_vals))
-                    p_sigma = float(np.std(p_vals)) or 1.0
-                    p_feat = ((p_vals - p_mu) / p_sigma).reshape(-1, 1)
-                    try:
-                        p_if = IsolationForest(n_estimators=100, contamination=0.005, random_state=42)
-                        p_if.fit(p_feat)
-                        p_pred = p_if.predict(p_feat)
-                        p_mask = p_pred == -1
-                    except Exception:
-                        p_mask = np.zeros(len(p_feat), dtype=bool)
-                    if p_mask.any():
-                        p_store = st.session_state["anoms"][method]["price"]
-                        for ts_val, p_val, is_anom in zip(dfd["ts"], dfd["price"], p_mask):
-                            if is_anom:
-                                p_store[float(ts_val)] = float(p_val)
-
-                v_vals = dfd["volume"].to_numpy(dtype=float)
-                if v_vals.size:
-                    v_mu = float(np.mean(v_vals))
-                    v_sigma = float(np.std(v_vals)) or 1.0
-                    v_feat = ((v_vals - v_mu) / v_sigma).reshape(-1, 1)
-                    try:
-                        v_if = IsolationForest(n_estimators=100, contamination=0.005, random_state=42)
-                        v_if.fit(v_feat)
-                        v_pred = v_if.predict(v_feat)
-                        v_mask = v_pred == -1
-                    except Exception:
-                        v_mask = np.zeros(len(v_feat), dtype=bool)
-                    if v_mask.any():
-                        v_store = st.session_state["anoms"][method]["volume"]
-                        for ts_val, v_val, is_anom in zip(dfd["ts"], dfd["volume"], v_mask):
-                            if is_anom:
-                                v_store[float(ts_val)] = float(v_val)
-        else:
-            notice_placeholder.info("Isolation Forest needs at least 10 ticks to warm up.")
-    else:
-        try:
-            from prophet import Prophet as _Prophet  # type: ignore
-        except Exception:
-            try:
-                from fbprophet import Prophet as _Prophet  # type: ignore
-            except Exception:
-                _Prophet = None
-
-        if _Prophet is None:
-            notice_placeholder.info("Model (Prophet) not available. Install 'prophet' to enable it.")
-        else:
-            def _prophet_flags(series_dt: pd.Series, series_y: pd.Series) -> pd.Series:
-                min_points = 30
-                if len(series_y) < min_points:
-                    return pd.Series([0] * len(series_y), index=series_y.index)
-                df_p = pd.DataFrame({"ds": series_dt, "y": series_y})
-                try:
-                    m = _Prophet(daily_seasonality=False, weekly_seasonality=False, yearly_seasonality=False)
-                    m.fit(df_p)
-                    yhat_df = m.predict(df_p[["ds"]])
-                    resid = df_p["y"].values - yhat_df["yhat"].values
-                    abs_resid = np.abs(resid)
-                    thr = abs_resid.mean() + 3 * abs_resid.std()
-                    flags = (abs_resid > thr).astype(int)
-                    return pd.Series(flags, index=series_y.index)
-                except Exception:
-                    return pd.Series([0] * len(series_y), index=series_y.index)
-
-            try:
-                import numpy as np  # type: ignore
-            except Exception:
-                np = None  # type: ignore
-
-            if np is not None:
-                p_flags = _prophet_flags(dfd["dt"], dfd["price"])
-                if p_flags.any():
-                    mask = p_flags == 1
-                    store = st.session_state["anoms"][method]["price"]
-                    for ts_val, y_val in zip(dfd.loc[mask, "ts"], dfd.loc[mask, "price"]):
-                        store[float(ts_val)] = float(y_val)
-
-                v_flags = _prophet_flags(dfd["dt"], dfd["volume"])
-                if v_flags.any():
-                    mask_v = v_flags == 1
-                    store = st.session_state["anoms"][method]["volume"]
-                    for ts_val, y_val in zip(dfd.loc[mask_v, "ts"], dfd.loc[mask_v, "volume"]):
-                        store[float(ts_val)] = float(y_val)
-
-    method_stores = st.session_state.get("anoms", {})
-    current_store = method_stores.get(method, {"price": {}, "volume": {}})
-    price_store = current_store.get("price", {})
-    vol_store = current_store.get("volume", {})
+    price_store, vol_store = update_anomaly_store_for_df(
+        df,
+        method,
+        rolling_on=rolling_on,
+        rolling_n=rolling_n,
+        notice_placeholder=notice_placeholder,
+        reset=False,
+    )
     price_count = len(price_store)
     vol_count = len(vol_store)
 
@@ -690,8 +767,11 @@ def _render_ohlcv_list():
         yaxis2_title="Volume",
         height=640,
         legend_tracegroupgap=6,
+        uirevision="tick-stream",
     )
-    chart_area.plotly_chart(fig, use_container_width=True)
+    fig.update_xaxes(uirevision="tick-stream")
+    fig.update_yaxes(uirevision="tick-stream")
+    chart_placeholder.plotly_chart(fig, use_container_width=True)
 
     try:
         c1, c2 = metric_placeholder.columns(2)
@@ -701,7 +781,7 @@ def _render_ohlcv_list():
         metric_placeholder.write(f"Price anomalies: {price_count} | Volume anomalies: {vol_count}")
 
 
-drain_queue()
+initial_updates = drain_queue()
 ticks_len = len(_ticks_only())
 runtime_params = st.session_state.get("sim_runtime_params") or st.session_state["sim_params"]
 dt_display = float(runtime_params.get("dt", st.session_state["sim_params"].get("dt", 1.0)))
@@ -713,10 +793,17 @@ if st.session_state.get("sim_error"):
 else:
     sim_error_placeholder.empty()
 
-_render_ohlcv_list()
+if initial_updates or not st.session_state.get("chart_rendered", False):
+    _render_ohlcv_list()
+    st.session_state["chart_rendered"] = True
+elif not ticks_len:
+    _render_ohlcv_list()
 
 if st.session_state["sim_status"] in {"starting", "running", "stopping"}:
-    for _ in range(1200):
+    refresh_interval = float(st.session_state.get("refresh_interval", 0.5) or 0.5)
+    refresh_interval = max(0.05, refresh_interval)
+    max_cycles = int(max(1, 600 / refresh_interval))
+    for _ in range(max_cycles):
         changed = drain_queue()
         if changed:
             ticks_len = len(_ticks_only())
@@ -730,4 +817,5 @@ if st.session_state["sim_status"] in {"starting", "running", "stopping"}:
             else:
                 sim_error_placeholder.empty()
             _render_ohlcv_list()
-        time.sleep(0.5)
+            st.session_state["chart_rendered"] = True
+        time.sleep(refresh_interval)
