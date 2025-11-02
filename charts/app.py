@@ -1,25 +1,24 @@
-# app.py
-import argparse
-import json
 import queue
-import sys
 import threading
 import time
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any, Dict
+import sys
 
-import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-
-# No OHLCV aggregation is used; we render tick lines directly
+import streamlit as st
 
 try:
-    from websocket import WebSocketApp
-except ImportError:
-    st.error("Missing dependency: install with `pip install websocket-client`")
-    st.stop()
+    from exchange_server.sim_feed import JDParams, jd_price_volume_stream
+except ModuleNotFoundError:
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from exchange_server.sim_feed import JDParams, jd_price_volume_stream
 
-# Anomaly utils
 try:
     from utils import (
         detect_price_anomalies_zscore,
@@ -33,184 +32,410 @@ except Exception:
     detect_price_anomalies_absmean3std = None
     detect_volume_anomalies_absmean3std = None
 
+st.set_page_config(layout="wide")
 
-# ----- CLI args -----
-def get_cli_args():
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--ws", "--websocket", dest="ws", default=None, help="WebSocket URL")
-    args, _ = parser.parse_known_args(sys.argv[1:])
-    return args
-
-
-args = get_cli_args()
-
-# ----- Session state -----
-st.session_state.setdefault("messages", [])
-st.session_state.setdefault("ws_queue", queue.Queue())
-st.session_state.setdefault("ws_thread", None)
-st.session_state.setdefault("ws_stop_event", threading.Event())
-st.session_state.setdefault("ws_url", args.ws)
-st.session_state.setdefault("ws_status", "disconnected")
-st.session_state.setdefault("ws_error", None)
-# Per-method anomaly stores: { method: { "price": {ts: val}, "volume": {ts: val} } }
-st.session_state.setdefault(
-    "anoms",
-    {
-        "Z-Score": {"price": {}, "volume": {}},
-        "Abs-Mean+3Std": {"price": {}, "volume": {}},
-        "Isolation Forest": {"price": {}, "volume": {}},
-        "Model (Prophet)": {"price": {}, "volume": {}},
-    },
-)
+ANOM_METHODS = [
+    "Z-Score",
+    "Abs-Mean+3Std",
+    "Isolation Forest",
+    "Model (Prophet)",
+]
+DEFAULT_PARAMS = JDParams()
 
 
-# ----- WebSocket worker -----
-def ws_worker(url: str, out_q: queue.Queue, stop_event: threading.Event):
-    def on_open(ws):
-        out_q.put({"_event": "open"})
-
-    def on_message(ws, message):
-        try:
-            out_q.put(json.loads(message))
-        except Exception:
-            out_q.put(message)
-
-    def on_error(ws, error):
-        out_q.put({"_event": "error", "error": str(error)})
-
-    def on_close(ws, status_code, close_msg):
-        out_q.put({"_event": "close", "status_code": status_code, "reason": close_msg})
-
-    ws = WebSocketApp(url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
-    t = threading.Thread(target=lambda: ws.run_forever(ping_interval=25, ping_timeout=10), daemon=True)
-    t.start()
-
-    # keep thread alive until asked to stop
-    while t.is_alive() and not stop_event.is_set():
-        time.sleep(0.2)
-    try:
-        ws.close()
-    except Exception:
-        pass
+def fresh_anom_store() -> Dict[str, Dict[str, Dict[float, float]]]:
+    return {method: {"price": {}, "volume": {}} for method in ANOM_METHODS}
 
 
-# ----- UI -----
-left_col, right_col = st.columns([1, 3])
-with left_col:
-    st.title("WebSocket Collector")
-    st.caption("Connects to a WebSocket, collects messages, and shows live price and volume lines.")
+if "messages" not in st.session_state:
+    st.session_state["messages"] = []
+if "feed_queue" not in st.session_state:
+    st.session_state["feed_queue"] = queue.Queue()
+if "sim_thread" not in st.session_state:
+    st.session_state["sim_thread"] = None
+if "sim_stop_event" not in st.session_state:
+    st.session_state["sim_stop_event"] = threading.Event()
+if "sim_status" not in st.session_state:
+    st.session_state["sim_status"] = "stopped"
+if "sim_error" not in st.session_state:
+    st.session_state["sim_error"] = None
+if "sim_params" not in st.session_state:
+    st.session_state["sim_params"] = asdict(DEFAULT_PARAMS)
+if "sim_runtime_params" not in st.session_state:
+    st.session_state["sim_runtime_params"] = None
+if "anoms" not in st.session_state:
+    st.session_state["anoms"] = fresh_anom_store()
+if "max_points" not in st.session_state:
+    st.session_state["max_points"] = 2000
+st.session_state.setdefault("anom_method", ANOM_METHODS[0])
+st.session_state.setdefault("rolling_on", False)
+st.session_state.setdefault("rolling_n", 20)
 
 
-def start_ws():
-    if not st.session_state.ws_url:
-        st.session_state.ws_error = "Please provide a WebSocket URL."
-        return
-    # reset
-    st.session_state.ws_error = None
-    st.session_state.messages.clear()
-    st.session_state.ws_stop_event = threading.Event()
-    st.session_state.ws_thread = threading.Thread(
-        target=ws_worker,
-        args=(st.session_state.ws_url, st.session_state.ws_queue, st.session_state.ws_stop_event),
-        daemon=True,
-    )
-    st.session_state.ws_thread.start()
-    st.session_state.ws_status = "connecting"
-
-
-def stop_ws():
-    if st.session_state.ws_thread and st.session_state.ws_thread.is_alive():
-        st.session_state.ws_stop_event.set()
-    st.session_state.ws_status = "disconnected"
-
-
-with left_col:
-    # Controls: URL input, detection method, start/stop
-    st.session_state.ws_url = st.text_input(
-        "WebSocket URL",
-        value=st.session_state.ws_url or "",
-        placeholder="ws://localhost:8765 or wss://example.com/stream",
-    )
-
-    anom_method = st.selectbox(
-        "Anomaly detection method",
-        options=["Z-Score", "Abs-Mean+3Std", "Isolation Forest", "Model (Prophet)"],
-        index=0,
-        help="Choose how anomalies are detected on price and volume.",
-    )
-    st.session_state["anom_method"] = anom_method
-
-    btn_col1, btn_col2 = st.columns(2)
-    with btn_col1:
-        if st.button("Start WebSocket", type="primary", use_container_width=True, key="btn_start_left"):
-            start_ws()
-    with btn_col2:
-        if st.button("Stop WebSocket", use_container_width=True, key="btn_stop_left"):
-            stop_ws()
-
-    # Rolling window controls (use stable Streamlit keys; avoid manual reassignment)
-    st.session_state.setdefault("rolling_on", False)
-    st.session_state.setdefault("rolling_n", 20)
-    st.toggle(
-        "Rolling window (ON = use last N ticks)",
-        key="rolling_on",
-        value=st.session_state.get("rolling_on", False),
-        help="When ON, anomaly detection uses a rolling window of the most recent N ticks; when OFF, it uses all collected ticks.",
-    )
-    if st.session_state.get("rolling_on", False):
-        st.selectbox(
-            "Window size (ticks)",
-            options=[20, 50, 100],
-            index={20: 0, 50: 1, 100: 2}.get(int(st.session_state.get("rolling_n", 20) or 20), 0),
-            key="rolling_n",
-            help="Number of most recent ticks to include when Rolling window is ON.",
-        )
-    if st.session_state.get("rolling_on", False):
-        st.info("Rolling window ON: detection uses only the most recent N ticks (editable above).")
+def build_params_from_state() -> JDParams:
+    params_dict: Dict[str, Any] = dict(st.session_state["sim_params"])
+    seed_val = params_dict.get("seed")
+    if seed_val in ("", None):
+        params_dict["seed"] = None
     else:
-        st.info("Rolling window OFF: detection uses all collected ticks.")
+        try:
+            params_dict["seed"] = int(seed_val)
+        except (TypeError, ValueError):
+            params_dict["seed"] = None
+    return JDParams(**params_dict)
 
 
-# drain queue helper
-def drain_queue():
+def sim_worker(
+    params: JDParams,
+    out_q: "queue.Queue[Dict[str, Any]]",
+    stop_event: threading.Event,
+) -> None:
+    """Background generator that streams ticks into a queue."""
+    try:
+        stream = jd_price_volume_stream(params)
+        out_q.put({"_event": "start", "params": asdict(params)})
+        while not stop_event.is_set():
+            tick = next(stream)
+            out_q.put(tick)
+            sleep_for = max(0.0, float(params.dt))
+            if sleep_for > 0.0:
+                time.sleep(sleep_for)
+    except Exception as exc:
+        out_q.put({"_event": "error", "error": str(exc)})
+    finally:
+        out_q.put({"_event": "stopped"})
+
+
+def start_sim() -> None:
+    existing = st.session_state.get("sim_thread")
+    if existing and existing.is_alive():
+        return
+
+    st.session_state["sim_error"] = None
+    st.session_state["messages"] = []
+    st.session_state["anoms"] = fresh_anom_store()
+    st.session_state["feed_queue"] = queue.Queue()
+
+    stop_event = threading.Event()
+    st.session_state["sim_stop_event"] = stop_event
+
+    params = build_params_from_state()
+    st.session_state["sim_runtime_params"] = asdict(params)
+
+    thread = threading.Thread(
+        target=sim_worker,
+        args=(params, st.session_state["feed_queue"], stop_event),
+        daemon=True,
+        name="jd-sim-feed",
+    )
+    st.session_state["sim_thread"] = thread
+    st.session_state["sim_status"] = "starting"
+    thread.start()
+
+
+def stop_sim() -> None:
+    thread = st.session_state.get("sim_thread")
+    if thread and thread.is_alive():
+        st.session_state["sim_stop_event"].set()
+        st.session_state["sim_status"] = "stopping"
+    else:
+        st.session_state["sim_status"] = "stopped"
+        st.session_state["sim_thread"] = None
+
+
+def drain_queue() -> int:
     updated = 0
+    max_points = int(st.session_state.get("max_points", 0) or 0)
+    q = st.session_state.get("feed_queue")
+    if q is None:
+        return updated
+
     while True:
         try:
-            item = st.session_state.ws_queue.get_nowait()
+            item = q.get_nowait()
         except queue.Empty:
             break
+
         updated += 1
-        if isinstance(item, dict) and item.get("_event") == "open":
-            st.session_state.ws_status = "connected"
+        if isinstance(item, dict) and item.get("_event") == "start":
+            st.session_state["sim_status"] = "running"
+            st.session_state["sim_runtime_params"] = item.get("params") or st.session_state.get("sim_runtime_params")
         elif isinstance(item, dict) and item.get("_event") == "error":
-            st.session_state.ws_error = item.get("error")
-            st.session_state.ws_status = "error"
-        elif isinstance(item, dict) and item.get("_event") == "close":
-            st.session_state.ws_status = "closed"
+            st.session_state["sim_error"] = item.get("error")
+            st.session_state["sim_status"] = "error"
+        elif isinstance(item, dict) and item.get("_event") == "stopped":
+            st.session_state["sim_status"] = "stopped"
+            st.session_state["sim_thread"] = None
         else:
-            st.session_state.messages.append(item)
+            st.session_state["messages"].append(item)
+            if max_points and len(st.session_state["messages"]) > max_points:
+                st.session_state["messages"] = st.session_state["messages"][-max_points:]
     return updated
 
 
-# status and counters on the left; chart on the right
-with left_col:
-    status_placeholder = st.empty()
-    error_placeholder = st.empty()
-    metric_placeholder = st.empty()
-with right_col:
-    bars_placeholder = st.empty()
-
-
-# ---- Tick helpers ----
 def _ticks_only():
     return [
-        m for m in st.session_state.messages
+        m
+        for m in st.session_state["messages"]
         if isinstance(m, dict) and all(k in m for k in ("ts", "price", "volume"))
     ]
 
 
+params = st.session_state["sim_params"]
+
+left_col, right_col = st.columns([1, 3])
+with left_col:
+    st.title("Anomaly Dashboard")
+    st.caption("Generate synthetic ticks and watch the anomaly detectors react in real time.")
+
+    with st.container():
+        current_method = st.session_state.get("anom_method", ANOM_METHODS[0])
+        try:
+            default_idx = ANOM_METHODS.index(current_method)
+        except ValueError:
+            default_idx = 0
+
+        anom_method = st.selectbox(
+            "Anomaly detection method",
+            options=ANOM_METHODS,
+            index=default_idx,
+            help="Choose the algorithm used to highlight price and volume anomalies.",
+        )
+        st.session_state["anom_method"] = anom_method
+
+        btn_col1, btn_col2 = st.columns(2)
+        if btn_col1.button("Start simulator", type="primary", use_container_width=True):
+            start_sim()
+        if btn_col2.button("Stop simulator", use_container_width=True):
+            stop_sim()
+
+        max_points_input = st.number_input(
+            "Max ticks to keep",
+            min_value=200,
+            max_value=10000,
+            step=200,
+            value=int(st.session_state["max_points"]),
+            help="Older ticks are dropped once this limit is reached.",
+        )
+        st.session_state["max_points"] = int(max_points_input)
+
+        st.toggle(
+            "Rolling window (ON = use last N ticks)",
+            key="rolling_on",
+            value=st.session_state.get("rolling_on", False),
+            help="When ON, anomaly detection uses the most recent N ticks.",
+        )
+        if st.session_state.get("rolling_on", False):
+            st.selectbox(
+                "Window size (ticks)",
+                options=[20, 50, 100],
+                index={20: 0, 50: 1, 100: 2}.get(int(st.session_state.get("rolling_n", 20) or 20), 0),
+                key="rolling_n",
+                help="Number of ticks considered when the rolling window is enabled.",
+            )
+            st.info("Rolling window ON: anomaly detection uses only the most recent N ticks.")
+        else:
+            st.info("Rolling window OFF: anomaly detection uses all collected ticks.")
+
+    status_placeholder = st.empty()
+    sim_error_placeholder = st.empty()
+    notice_placeholder = st.empty()
+    metric_placeholder = st.empty()
+
+    with st.expander("Simulator parameters", expanded=False):
+        col_dt, col_seed = st.columns(2)
+        params["dt"] = float(
+            col_dt.number_input(
+                "Seconds between ticks",
+                min_value=0.01,
+                max_value=5.0,
+                step=0.05,
+                value=float(params["dt"]),
+                help="Controls the cadence of generated ticks.",
+            )
+        )
+        seed_text = col_seed.text_input(
+            "Random seed (blank = random)",
+            value="" if params.get("seed") in (None, "") else str(int(params["seed"])),
+            help="Use a fixed seed for reproducible streams or leave blank for randomness.",
+        )
+        if seed_text.strip():
+            try:
+                params["seed"] = int(seed_text.strip())
+            except ValueError:
+                st.warning("Invalid seed input; using random seed instead.")
+                params["seed"] = None
+        else:
+            params["seed"] = None
+
+        col_mu, col_sigma = st.columns(2)
+        params["mu"] = float(
+            col_mu.number_input(
+                "Log-drift (mu)",
+                min_value=-0.5,
+                max_value=0.5,
+                step=0.01,
+                value=float(params["mu"]),
+            )
+        )
+        params["sigma"] = float(
+            col_sigma.number_input(
+                "Diffusion volatility (sigma)",
+                min_value=0.0,
+                max_value=1.0,
+                step=0.01,
+                value=float(params["sigma"]),
+            )
+        )
+
+        st.divider()
+
+        col_jump1, col_jump2 = st.columns(2)
+        params["jump_lambda"] = float(
+            col_jump1.number_input(
+                "Jump intensity (lambda)",
+                min_value=0.0,
+                max_value=1.0,
+                step=0.01,
+                value=float(params["jump_lambda"]),
+            )
+        )
+        params["jump_sigma"] = float(
+            col_jump2.number_input(
+                "Jump std dev",
+                min_value=0.0,
+                max_value=0.5,
+                step=0.01,
+                value=float(params["jump_sigma"]),
+            )
+        )
+
+        col_jump_mu, col_v0 = st.columns(2)
+        params["jump_mu"] = float(
+            col_jump_mu.number_input(
+                "Jump mean",
+                min_value=-0.5,
+                max_value=0.5,
+                step=0.01,
+                value=float(params["jump_mu"]),
+            )
+        )
+        params["v0"] = float(
+            col_v0.number_input(
+                "Initial volume",
+                min_value=1000.0,
+                max_value=1_000_000.0,
+                step=1000.0,
+                value=float(params["v0"]),
+            )
+        )
+
+        col_phi, col_beta = st.columns(2)
+        params["phi"] = float(
+            col_phi.slider(
+                "Volume persistence (phi)",
+                min_value=0.0,
+                max_value=0.99,
+                step=0.01,
+                value=float(params["phi"]),
+            )
+        )
+        params["beta"] = float(
+            col_beta.number_input(
+                "Volume sensitivity (beta)",
+                min_value=0.0,
+                max_value=40.0,
+                step=1.0,
+                value=float(params["beta"]),
+            )
+        )
+
+        col_gamma, col_sigma_v = st.columns(2)
+        params["gamma"] = float(
+            col_gamma.number_input(
+                "Volume jump bump (gamma)",
+                min_value=0.0,
+                max_value=5.0,
+                step=0.1,
+                value=float(params["gamma"]),
+            )
+        )
+        params["sigma_v"] = float(
+            col_sigma_v.number_input(
+                "Volume noise (sigma_v)",
+                min_value=0.0,
+                max_value=2.0,
+                step=0.05,
+                value=float(params["sigma_v"]),
+            )
+        )
+
+        col_anom_prob, col_anom_min = st.columns(2)
+        params["anomaly_prob"] = float(
+            col_anom_prob.number_input(
+                "Anomaly probability",
+                min_value=0.0,
+                max_value=0.05,
+                step=0.001,
+                value=float(params["anomaly_prob"]),
+            )
+        )
+        params["anomaly_min"] = float(
+            col_anom_min.number_input(
+                "Anomaly min move",
+                min_value=0.0,
+                max_value=0.5,
+                step=0.01,
+                value=float(params["anomaly_min"]),
+            )
+        )
+
+        col_anom_max, col_vol_min = st.columns(2)
+        params["anomaly_max"] = float(
+            col_anom_max.number_input(
+                "Anomaly max move",
+                min_value=0.0,
+                max_value=0.5,
+                step=0.01,
+                value=float(params["anomaly_max"]),
+            )
+        )
+        params["vol_anom_min"] = float(
+            col_vol_min.number_input(
+                "Volume anomaly min multiplier",
+                min_value=1.0,
+                max_value=20.0,
+                step=0.5,
+                value=float(params["vol_anom_min"]),
+            )
+        )
+
+        col_vol_max, col_trading = st.columns(2)
+        params["vol_anom_max"] = float(
+            col_vol_max.number_input(
+                "Volume anomaly max multiplier",
+                min_value=1.0,
+                max_value=30.0,
+                step=0.5,
+                value=float(params["vol_anom_max"]),
+            )
+        )
+        params["trading_seconds"] = float(
+            col_trading.number_input(
+                "Trading day seconds",
+                min_value=1000.0,
+                max_value=86400.0,
+                step=600.0,
+                value=float(params["trading_seconds"]),
+            )
+        )
+
+with right_col:
+    bars_placeholder = st.empty()
+
+
 def _render_ohlcv_list():
-    # Render a simple live line chart for price and volume as ticks arrive
+    notice_placeholder.empty()
     ticks = _ticks_only()
     if not ticks:
         bars_placeholder.info("Waiting for tick data...")
@@ -220,7 +445,6 @@ def _render_ohlcv_list():
     df = df.sort_values("ts")
     df["dt"] = pd.to_datetime(df["ts"], unit="s")
 
-    # Two-row layout: price (top), volume bars (bottom)
     fig = make_subplots(
         rows=2,
         cols=1,
@@ -228,7 +452,6 @@ def _render_ohlcv_list():
         vertical_spacing=0.03,
         row_heights=[0.72, 0.28],
     )
-    # Price line (row 1)
     fig.add_trace(
         go.Scatter(
             x=df["dt"],
@@ -240,7 +463,6 @@ def _render_ohlcv_list():
         row=1,
         col=1,
     )
-    # Volume bars (row 2), colored by price tick direction
     try:
         dir_series = (df["price"].diff().fillna(0)).apply(lambda x: 1 if x >= 0 else -1)
     except Exception:
@@ -258,28 +480,20 @@ def _render_ohlcv_list():
         col=1,
     )
 
-    # Z-score anomaly markers for price and volume
     price_count = 0
     vol_count = 0
 
-    # Choose detection dataframe based on rolling window setting
     rolling_on = st.session_state.get("rolling_on", False)
     rolling_n = int(st.session_state.get("rolling_n", 20) or 20)
     dfd = df.tail(max(1, rolling_n)) if rolling_on else df
 
     method = st.session_state.get("anom_method", "Z-Score")
-    # Ensure store exists for current method (handles older sessions missing new keys)
-    try:
-        st.session_state["anoms"].setdefault(method, {"price": {}, "volume": {}})
-    except Exception:
-        st.session_state["anoms"] = {method: {"price": {}, "volume": {}}}
+    st.session_state["anoms"].setdefault(method, {"price": {}, "volume": {}})
     if method == "Z-Score":
-        # Z-score based detection on tick-to-tick returns
         if detect_price_anomalies_zscore:
             price_flags = detect_price_anomalies_zscore(dfd["price"].tolist())
             if price_flags:
                 mask = pd.Series(price_flags[: len(dfd)], index=dfd.index) == 1
-                # Persist newly found anomalies
                 if mask.any():
                     store = st.session_state["anoms"][method]["price"]
                     for ts_val, y_val in zip(dfd.loc[mask, "ts"], dfd.loc[mask, "price"]):
@@ -294,7 +508,6 @@ def _render_ohlcv_list():
                     for ts_val, y_val in zip(dfd.loc[mask_v, "ts"], dfd.loc[mask_v, "volume"]):
                         store[float(ts_val)] = float(y_val)
     elif method == "Abs-Mean+3Std":
-        # Absolute-return threshold method: |r| > mean(|r|) + 3*std(|r|)
         if detect_price_anomalies_absmean3std:
             price_flags = detect_price_anomalies_absmean3std(dfd["price"].tolist())
             if price_flags:
@@ -313,15 +526,13 @@ def _render_ohlcv_list():
                     for ts_val, y_val in zip(dfd.loc[mask_v, "ts"], dfd.loc[mask_v, "volume"]):
                         store[float(ts_val)] = float(y_val)
     elif method == "Isolation Forest":
-        # Apply Isolation Forest independently on price and volume only when enough data exists
         if len(dfd) >= 10:
             try:
                 import numpy as np  # type: ignore
                 from sklearn.ensemble import IsolationForest  # type: ignore
             except Exception:
-                error_placeholder.info("Isolation Forest not available. Install scikit-learn to enable it.")
+                notice_placeholder.info("Isolation Forest not available. Install scikit-learn to enable it.")
             else:
-                # Price IF
                 p_vals = dfd["price"].to_numpy(dtype=float)
                 if p_vals.size:
                     p_mu = float(np.mean(p_vals))
@@ -330,7 +541,7 @@ def _render_ohlcv_list():
                     try:
                         p_if = IsolationForest(n_estimators=100, contamination=0.005, random_state=42)
                         p_if.fit(p_feat)
-                        p_pred = p_if.predict(p_feat)  # -1 outlier
+                        p_pred = p_if.predict(p_feat)
                         p_mask = p_pred == -1
                     except Exception:
                         p_mask = np.zeros(len(p_feat), dtype=bool)
@@ -340,7 +551,6 @@ def _render_ohlcv_list():
                             if is_anom:
                                 p_store[float(ts_val)] = float(p_val)
 
-                # Volume IF
                 v_vals = dfd["volume"].to_numpy(dtype=float)
                 if v_vals.size:
                     v_mu = float(np.mean(v_vals))
@@ -358,30 +568,27 @@ def _render_ohlcv_list():
                         for ts_val, v_val, is_anom in zip(dfd["ts"], dfd["volume"], v_mask):
                             if is_anom:
                                 v_store[float(ts_val)] = float(v_val)
+        else:
+            notice_placeholder.info("Isolation Forest needs at least 10 ticks to warm up.")
     else:
-        # Prophet-based residual anomalies
-        Prophet = None
         try:
             from prophet import Prophet as _Prophet  # type: ignore
-            Prophet = _Prophet
         except Exception:
             try:
                 from fbprophet import Prophet as _Prophet  # type: ignore
-                Prophet = _Prophet
             except Exception:
-                Prophet = None
+                _Prophet = None
 
-        if Prophet is None:
-            error_placeholder.info("Model (Prophet) not available. Install 'prophet' to enable model-based anomalies.")
+        if _Prophet is None:
+            notice_placeholder.info("Model (Prophet) not available. Install 'prophet' to enable it.")
         else:
-            # Helper to compute residual-based flags on a single series
             def _prophet_flags(series_dt: pd.Series, series_y: pd.Series) -> pd.Series:
                 min_points = 30
                 if len(series_y) < min_points:
                     return pd.Series([0] * len(series_y), index=series_y.index)
                 df_p = pd.DataFrame({"ds": series_dt, "y": series_y})
                 try:
-                    m = Prophet(daily_seasonality=False, weekly_seasonality=False, yearly_seasonality=False)
+                    m = _Prophet(daily_seasonality=False, weekly_seasonality=False, yearly_seasonality=False)
                     m.fit(df_p)
                     yhat_df = m.predict(df_p[["ds"]])
                     resid = df_p["y"].values - yhat_df["yhat"].values
@@ -392,29 +599,26 @@ def _render_ohlcv_list():
                 except Exception:
                     return pd.Series([0] * len(series_y), index=series_y.index)
 
-            # Price flags
             try:
-                import numpy as np  # local import for std/mean
+                import numpy as np  # type: ignore
             except Exception:
                 np = None  # type: ignore
 
             if np is not None:
-                p_flags = _prophet_flags(dfd["dt"], dfd["price"]) 
+                p_flags = _prophet_flags(dfd["dt"], dfd["price"])
                 if p_flags.any():
                     mask = p_flags == 1
                     store = st.session_state["anoms"][method]["price"]
                     for ts_val, y_val in zip(dfd.loc[mask, "ts"], dfd.loc[mask, "price"]):
                         store[float(ts_val)] = float(y_val)
 
-                # Volume flags
-                v_flags = _prophet_flags(dfd["dt"], dfd["volume"]) 
+                v_flags = _prophet_flags(dfd["dt"], dfd["volume"])
                 if v_flags.any():
                     mask_v = v_flags == 1
                     store = st.session_state["anoms"][method]["volume"]
                     for ts_val, y_val in zip(dfd.loc[mask_v, "ts"], dfd.loc[mask_v, "volume"]):
                         store[float(ts_val)] = float(y_val)
 
-    # After updating anomaly stores, draw all accumulated anomalies
     method_stores = st.session_state.get("anoms", {})
     current_store = method_stores.get(method, {"price": {}, "volume": {}})
     price_store = current_store.get("price", {})
@@ -422,10 +626,9 @@ def _render_ohlcv_list():
     price_count = len(price_store)
     vol_count = len(vol_store)
 
-    # Visual style mapping per method
     name_suffix = {
         "Z-Score": "z-score",
-        "Abs-Mean+3Std": "abs+3σ",
+        "Abs-Mean+3Std": "abs+3std",
         "Isolation Forest": "iForest",
         "Model (Prophet)": "model",
     }
@@ -490,7 +693,6 @@ def _render_ohlcv_list():
     )
     bars_placeholder.plotly_chart(fig, use_container_width=True)
 
-    # Streamlit metrics for quick anomaly visibility
     try:
         c1, c2 = metric_placeholder.columns(2)
         c1.metric(label="Price anomalies", value=str(price_count))
@@ -499,37 +701,35 @@ def _render_ohlcv_list():
         metric_placeholder.write(f"Price anomalies: {price_count} | Volume anomalies: {vol_count}")
 
 
-# live update toggle
-live = st.toggle("Live update", value=True, help="Continuously refresh the message count.")
+live = st.toggle("Live update", value=True, help="Continuously refresh the chart while the simulator runs.")
 
-# initial render
 drain_queue()
-status_placeholder.write(f"Status: **{st.session_state.ws_status}**")
-if st.session_state.ws_error:
-    error_placeholder.error(st.session_state.ws_error)
+ticks_len = len(_ticks_only())
+runtime_params = st.session_state.get("sim_runtime_params") or st.session_state["sim_params"]
+dt_display = float(runtime_params.get("dt", st.session_state["sim_params"].get("dt", 1.0)))
+status_placeholder.write(
+    f"Simulator: **{st.session_state['sim_status']}** · ticks: {ticks_len} · dt={dt_display:.2f}s"
+)
+if st.session_state.get("sim_error"):
+    sim_error_placeholder.error(st.session_state["sim_error"])
+else:
+    sim_error_placeholder.empty()
+
 _render_ohlcv_list()
 
-# live loop (no extra packages; updates UI ~2x/sec)
-if live and st.session_state.ws_status in {"connecting", "connected"}:
-    # Run a short-lived loop so we don't block forever on a single run.
-    # On every rerun, this block can continue updating while the WebSocket thread feeds data.
-    for _ in range(1200):  # ~10 minutes total; rerun or toggle again to extend
+if live and st.session_state["sim_status"] in {"starting", "running", "stopping"}:
+    for _ in range(1200):
         changed = drain_queue()
         if changed:
+            ticks_len = len(_ticks_only())
+            runtime_params = st.session_state.get("sim_runtime_params") or st.session_state["sim_params"]
+            dt_display = float(runtime_params.get("dt", st.session_state["sim_params"].get("dt", 1.0)))
+            status_placeholder.write(
+                f"Simulator: **{st.session_state['sim_status']}** · ticks: {ticks_len} · dt={dt_display:.2f}s"
+            )
+            if st.session_state.get("sim_error"):
+                sim_error_placeholder.error(st.session_state["sim_error"])
+            else:
+                sim_error_placeholder.empty()
             _render_ohlcv_list()
-            status_placeholder.write(f"Status: **{st.session_state.ws_status}**")
-            if st.session_state.ws_error:
-                error_placeholder.error(st.session_state.ws_error)
         time.sleep(0.5)
-
-# Ensure the app uses wide layout so the chart can take more space
-try:
-    import streamlit as st  # type: ignore
-    # set_page_config must be called before any other st.* call
-    try:
-        st.set_page_config(layout="wide")
-    except Exception:
-        # Already configured or running in a non-Streamlit context
-        pass
-except Exception:
-    pass
