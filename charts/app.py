@@ -40,6 +40,24 @@ ANOM_METHODS = [
     "Isolation Forest",
     "Model (Prophet)",
 ]
+ANOM_METHOD_DESCRIPTIONS = {
+    "Z-Score": (
+        "Flags ticks where the standardized price or volume change exceeds three standard deviations,"
+        " highlighting extreme outliers compared with recent history."
+    ),
+    "Abs-Mean+3Std": (
+        "Uses the absolute tick change relative to its mean plus three standard deviations,"
+        " catching large moves regardless of direction."
+    ),
+    "Isolation Forest": (
+        "Applies an unsupervised Isolation Forest model to normalized price and volume values"
+        " to surface points that are isolated in feature space."
+    ),
+    "Model (Prophet)": (
+        "Fits a Prophet time-series model and marks ticks where the residual exceeds"
+        " three standard deviations from the fitted trend."
+    ),
+}
 DEFAULT_PARAMS = JDParams()
 
 
@@ -640,6 +658,7 @@ with left_col:
 with right_col:
     wait_placeholder = st.empty()
     chart_placeholder = st.empty()
+    explanation_placeholder = st.empty()
 
 
 def _render_ohlcv_list():
@@ -647,6 +666,7 @@ def _render_ohlcv_list():
     ticks = _ticks_only()
     if not ticks:
         chart_placeholder.empty()
+        explanation_placeholder.empty()
         with wait_placeholder:
             st.spinner("Waiting for tick data...")
         st.session_state["chart_rendered"] = False
@@ -712,7 +732,7 @@ def _render_ohlcv_list():
         "Z-Score": "z-score",
         "Abs-Mean+3Std": "abs+3std",
         "Isolation Forest": "iForest",
-        "Model (Prophet)": "model",
+        "Prophet - Linear Regression": "model",
     }
     price_color = {
         "Z-Score": "#9c27b0",
@@ -787,6 +807,12 @@ def _render_ohlcv_list():
     st.session_state["chart_render_count"] = st.session_state.get("chart_render_count", 0) + 1
     chart_key = f"plotly-chart-{st.session_state['chart_render_count']}"
     chart_placeholder.plotly_chart(fig, use_container_width=True, key=chart_key)
+
+    method_desc = ANOM_METHOD_DESCRIPTIONS.get(method)
+    if method_desc:
+        explanation_placeholder.markdown(f"**{method}**: {method_desc}")
+    else:
+        explanation_placeholder.empty()
 
     try:
         c1, c2 = metric_placeholder.columns(2)
