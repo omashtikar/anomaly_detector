@@ -68,10 +68,12 @@ if "anoms" not in st.session_state:
 if "max_points" not in st.session_state:
     st.session_state["max_points"] = 2000
 st.session_state.setdefault("anom_method", ANOM_METHODS[0])
+st.session_state.setdefault("anom_method_select", st.session_state["anom_method"])
 st.session_state.setdefault("rolling_on", False)
 st.session_state.setdefault("rolling_n", 20)
 st.session_state.setdefault("refresh_interval", 0.5)
 st.session_state.setdefault("chart_rendered", False)
+st.session_state.setdefault("chart_render_count", 0)
 
 
 def build_params_from_state() -> JDParams:
@@ -109,9 +111,16 @@ def sim_worker(
 
 
 def start_sim() -> None:
+    drain_queue()
     existing = st.session_state.get("sim_thread")
+    stop_event = st.session_state.get("sim_stop_event")
     if existing and existing.is_alive():
-        return
+        if stop_event and stop_event.is_set():
+            st.session_state["sim_thread"] = None
+        else:
+            return
+    else:
+        st.session_state["sim_thread"] = None
 
     st.session_state["sim_error"] = None
     st.session_state["messages"] = []
@@ -372,20 +381,15 @@ with left_col:
     st.title("Anomaly Dashboard")
 
     with st.container():
-        current_method = st.session_state.get("anom_method", ANOM_METHODS[0])
-        try:
-            default_idx = ANOM_METHODS.index(current_method)
-        except ValueError:
-            default_idx = 0
-
         anom_method = st.selectbox(
             "Anomaly detection method",
             options=ANOM_METHODS,
-            index=default_idx,
+            key="anom_method_select",
             help="Choose the algorithm used to highlight price and volume anomalies.",
         )
 
-        if anom_method != st.session_state.get("anom_method"):
+        current_method = st.session_state.get("anom_method", ANOM_METHODS[0])
+        if anom_method != current_method:
             st.session_state["anom_method"] = anom_method
             stop_sim()
             drain_queue()
@@ -394,15 +398,16 @@ with left_col:
             st.session_state["chart_rendered"] = False
 
         btn_col1, btn_col2 = st.columns(2)
-        sim_status = st.session_state.get("sim_status", "stopped")
-        start_label = "Resume simulator" if sim_status not in {"stopped", "error"} else "Start simulator"
-        if btn_col1.button(start_label, type="primary", use_container_width=True):
+        if btn_col1.button("Start simulator", type="primary", use_container_width=True):
             start_sim()
         if btn_col2.button("Stop simulator", use_container_width=True):
             stop_sim()
 
-        if st.session_state.get("sim_status") == "stopped":
+        sim_status = st.session_state.get("sim_status", "stopped")
+        if sim_status == "stopped":
             st.caption("Simulator paused. Click Start simulator to stream new ticks.")
+        elif sim_status == "error":
+            st.caption("Simulator error. Adjust parameters and click Start simulator to try again.")
 
         max_points_input = st.number_input(
             "Max ticks to keep",
@@ -739,7 +744,7 @@ def _render_ohlcv_list():
             col=1,
         )
         for x_val in p_dt:
-            fig.add_vline(x=x_val, line_color=price_color, opacity=0.15, row=1, col=1)
+            fig.add_vline(x=x_val, line_color=price_color, opacity=0.3, line_width=2.5, row=1, col=1)
 
     if vol_store:
         v_ts = list(vol_store.keys())
@@ -758,7 +763,15 @@ def _render_ohlcv_list():
             col=1,
         )
         for x_val in v_dt:
-            fig.add_vline(x=x_val, line_color=vol_color, opacity=0.12, line_dash="dot", row=2, col=1)
+            fig.add_vline(
+                x=x_val,
+                line_color=vol_color,
+                opacity=0.25,
+                line_width=2.0,
+                line_dash="dot",
+                row=2,
+                col=1,
+            )
 
     fig.update_layout(
         margin=dict(l=10, r=10, t=20, b=10),
@@ -771,7 +784,9 @@ def _render_ohlcv_list():
     )
     fig.update_xaxes(uirevision="tick-stream")
     fig.update_yaxes(uirevision="tick-stream")
-    chart_placeholder.plotly_chart(fig, use_container_width=True)
+    st.session_state["chart_render_count"] = st.session_state.get("chart_render_count", 0) + 1
+    chart_key = f"plotly-chart-{st.session_state['chart_render_count']}"
+    chart_placeholder.plotly_chart(fig, use_container_width=True, key=chart_key)
 
     try:
         c1, c2 = metric_placeholder.columns(2)
